@@ -1,4 +1,13 @@
-"""Dataset loaders for generated Heston transition data."""
+"""Dataset loaders for generated Heston transition data.
+
+Three loaders:
+- ``HestonTransitionDataset``: legacy single-stage joint dataset (condition
+  ``(log_v_t, r_t)``, target ``(log_v_next, r_next)``).
+- ``HestonVolTransitionDataset``: V3 Stage 1a dataset (condition
+  ``(log_v_t, a_t_onehot)``, target ``log_v_next``).
+- ``HestonRetTransitionDataset``: V3 Stage 1b dataset (condition
+  ``(log_v_next, log_v_t, r_t, a_t_onehot)``, target ``r_next``).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +19,7 @@ from torch.utils.data import Dataset
 
 
 class HestonTransitionDataset(Dataset[dict[str, torch.Tensor]]):
-    """Load flattened V3 transitions from a generated `*_transitions.npz` file."""
+    """Single-stage joint dataset (kept for backward compatibility)."""
 
     def __init__(
         self,
@@ -62,4 +71,170 @@ class HestonTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "r_t": condition[1],
             "log_v_next": target[0],
             "r_next": target[1],
+        }
+
+
+def _load_action_array(npz_files: list[str], npz: np.lib.npyio.NpzFile, n: int) -> np.ndarray:
+    if "action" in npz_files:
+        return np.asarray(npz["action"], dtype=np.int64)
+    return np.zeros(n, dtype=np.int64)
+
+
+def _one_hot(index: int, dim: int) -> torch.Tensor:
+    out = torch.zeros(dim, dtype=torch.float32)
+    if index < 0 or index >= dim:
+        raise IndexError(f"action index {index} out of range [0, {dim})")
+    out[index] = 1.0
+    return out
+
+
+class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
+    """V3 Stage 1a: variance transition kernel.
+
+    condition: ``[log_v_t_norm, a_t_onehot]`` of size ``1 + num_actions``
+    target:    ``[log_v_next_norm]`` of size ``1``
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        normalize: bool = False,
+        log_v_mean: float = 0.0,
+        log_v_std: float = 1.0,
+        num_actions: int = 1,
+    ) -> None:
+        self.path = Path(path)
+        self.normalize = normalize
+        self.log_v_mean = float(log_v_mean)
+        self.log_v_std = float(log_v_std)
+        self.num_actions = int(num_actions)
+        if self.log_v_std <= 0:
+            raise ValueError("log_v_std must be positive")
+        if self.num_actions <= 0:
+            raise ValueError("num_actions must be positive")
+
+        npz = np.load(self.path)
+        required = {"log_v_t", "log_v_next"}
+        missing = required.difference(npz.files)
+        if missing:
+            raise ValueError(f"missing transition arrays: {sorted(missing)}")
+        self.log_v_t = np.asarray(npz["log_v_t"], dtype=np.float32)
+        self.log_v_next = np.asarray(npz["log_v_next"], dtype=np.float32)
+        self.action = _load_action_array(list(npz.files), npz, self.log_v_t.shape[0])
+        npz.close()
+
+    @property
+    def condition_dim(self) -> int:
+        return 1 + self.num_actions
+
+    @property
+    def state_dim(self) -> int:
+        return 1
+
+    def __len__(self) -> int:
+        return int(self.log_v_t.shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        log_v_t = float(self.log_v_t[index])
+        log_v_next = float(self.log_v_next[index])
+        action = int(self.action[index])
+
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+
+        a_onehot = _one_hot(action, self.num_actions)
+        condition = torch.cat([torch.tensor([log_v_t], dtype=torch.float32), a_onehot])
+        target = torch.tensor([log_v_next], dtype=torch.float32)
+        return {
+            "condition": condition,
+            "target": target,
+            "log_v_t": torch.tensor(log_v_t, dtype=torch.float32),
+            "log_v_next": target[0],
+            "action": torch.tensor(action, dtype=torch.long),
+        }
+
+
+class HestonRetTransitionDataset(Dataset[dict[str, torch.Tensor]]):
+    """V3 Stage 1b: return transition kernel conditioned on already-known v_{t+1}.
+
+    condition: ``[log_v_next_norm, log_v_t_norm, r_t_norm, a_t_onehot]``
+               of size ``3 + num_actions``
+    target:    ``[r_next_norm]`` of size ``1``
+
+    During training ``log_v_next`` is the ground-truth variance (teacher
+    forcing); at inference time it comes from the Stage 1a sampler.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        normalize: bool = False,
+        log_v_mean: float = 0.0,
+        log_v_std: float = 1.0,
+        return_mean: float = 0.0,
+        return_std: float = 1.0,
+        num_actions: int = 1,
+    ) -> None:
+        self.path = Path(path)
+        self.normalize = normalize
+        self.log_v_mean = float(log_v_mean)
+        self.log_v_std = float(log_v_std)
+        self.return_mean = float(return_mean)
+        self.return_std = float(return_std)
+        self.num_actions = int(num_actions)
+        if self.log_v_std <= 0 or self.return_std <= 0:
+            raise ValueError("normalization std values must be positive")
+        if self.num_actions <= 0:
+            raise ValueError("num_actions must be positive")
+
+        npz = np.load(self.path)
+        required = {"log_v_t", "log_v_next", "r_t", "r_next"}
+        missing = required.difference(npz.files)
+        if missing:
+            raise ValueError(f"missing transition arrays: {sorted(missing)}")
+        self.log_v_t = np.asarray(npz["log_v_t"], dtype=np.float32)
+        self.log_v_next = np.asarray(npz["log_v_next"], dtype=np.float32)
+        self.r_t = np.asarray(npz["r_t"], dtype=np.float32)
+        self.r_next = np.asarray(npz["r_next"], dtype=np.float32)
+        self.action = _load_action_array(list(npz.files), npz, self.log_v_t.shape[0])
+        npz.close()
+
+    @property
+    def condition_dim(self) -> int:
+        return 3 + self.num_actions
+
+    @property
+    def state_dim(self) -> int:
+        return 1
+
+    def __len__(self) -> int:
+        return int(self.r_next.shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        log_v_t = float(self.log_v_t[index])
+        log_v_next = float(self.log_v_next[index])
+        r_t = float(self.r_t[index])
+        r_next = float(self.r_next[index])
+        action = int(self.action[index])
+
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+            r_t = (r_t - self.return_mean) / self.return_std
+            r_next = (r_next - self.return_mean) / self.return_std
+
+        a_onehot = _one_hot(action, self.num_actions)
+        condition = torch.cat(
+            [torch.tensor([log_v_next, log_v_t, r_t], dtype=torch.float32), a_onehot]
+        )
+        target = torch.tensor([r_next], dtype=torch.float32)
+        return {
+            "condition": condition,
+            "target": target,
+            "log_v_next": torch.tensor(log_v_next, dtype=torch.float32),
+            "log_v_t": torch.tensor(log_v_t, dtype=torch.float32),
+            "r_t": torch.tensor(r_t, dtype=torch.float32),
+            "r_next": target[0],
+            "action": torch.tensor(action, dtype=torch.long),
         }
