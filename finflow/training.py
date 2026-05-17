@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import random
+import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +27,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 from finflow.data import (
     HestonRetTransitionDataset,
@@ -77,6 +80,8 @@ class TransitionFMTrainConfig:
     log_every: int = 50
     max_train_batches: int | None = None
     max_val_batches: int | None = None
+    progress: bool = True
+    progress_min_interval: float = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -151,18 +156,52 @@ def _effective_num_batches(loader: DataLoader, max_batches: int | None) -> int:
     return min(len(loader), max_batches)
 
 
+def _make_progress(
+    iterable,
+    total: int,
+    desc: str,
+    disable: bool,
+    min_interval: float = 0.2,
+):
+    # When stderr is not a real TTY (piped to file, captured by pytest, etc.)
+    # tqdm cannot rewrite a single line, so crank up the refresh interval so
+    # the log file gets one progress line every few seconds instead of one
+    # per micro-batch.
+    if not disable and not sys.stderr.isatty():
+        min_interval = max(min_interval, 10.0)
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        disable=disable,
+        leave=False,
+        dynamic_ncols=True,
+        mininterval=min_interval,
+        file=sys.stderr,
+    )
+
+
 def evaluate_model(
     model: TransitionFM,
     loader: DataLoader,
     device: torch.device,
     time_eps: float,
     max_batches: int | None = None,
+    desc: str = "val",
+    disable_progress: bool = False,
+    progress_min_interval: float = 0.2,
 ) -> float:
     model.eval()
     total_loss = 0.0
     total_items = 0
+    total = _effective_num_batches(loader, max_batches)
+    bar = _make_progress(
+        _iterate_batches(loader, max_batches),
+        total=total, desc=desc,
+        disable=disable_progress, min_interval=progress_min_interval,
+    )
     with torch.no_grad():
-        for batch in _iterate_batches(loader, max_batches):
+        for batch in bar:
             condition = batch["condition"].to(device)
             target = batch["target"].to(device)
             loss = conditional_flow_matching_loss(
@@ -171,6 +210,9 @@ def evaluate_model(
             batch_size = condition.shape[0]
             total_loss += float(loss.item()) * batch_size
             total_items += batch_size
+            if not disable_progress:
+                bar.set_postfix(loss=f"{total_loss / max(total_items, 1):.4f}", refresh=False)
+    bar.close()
     return total_loss / max(total_items, 1)
 
 
@@ -182,11 +224,20 @@ def train_one_epoch(
     time_eps: float,
     grad_clip_norm: float,
     max_batches: int | None = None,
+    desc: str = "train",
+    disable_progress: bool = False,
+    progress_min_interval: float = 0.2,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_items = 0
-    for batch in _iterate_batches(loader, max_batches):
+    total = _effective_num_batches(loader, max_batches)
+    bar = _make_progress(
+        _iterate_batches(loader, max_batches),
+        total=total, desc=desc,
+        disable=disable_progress, min_interval=progress_min_interval,
+    )
+    for batch in bar:
         condition = batch["condition"].to(device, non_blocking=True)
         target = batch["target"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -200,6 +251,9 @@ def train_one_epoch(
         batch_size = condition.shape[0]
         total_loss += float(loss.item()) * batch_size
         total_items += batch_size
+        if not disable_progress:
+            bar.set_postfix(loss=f"{total_loss / max(total_items, 1):.4f}", refresh=False)
+    bar.close()
     return total_loss / max(total_items, 1)
 
 
@@ -300,19 +354,49 @@ def _run_fm_training(
     global_step = 0
     history: list[dict[str, Any]] = []
 
+    disable_progress = not train_config.progress
+    train_batches = _effective_num_batches(train_loader, train_config.max_train_batches)
+    val_batches = _effective_num_batches(val_loader, train_config.max_val_batches)
+    n_params = sum(p.numel() for p in model.parameters())
+
+    if train_config.progress:
+        header = (
+            f"[finflow] stage={stage} | run={run_dir.name} | device={device} | "
+            f"params={n_params/1e3:.1f}k | train={len(datasets['train'])} samples "
+            f"({train_batches} batch/epoch x {train_config.batch_size}) | "
+            f"val={len(datasets['val'])} samples ({val_batches} batch) | epochs={train_config.epochs}"
+        )
+        print(header, file=sys.stderr, flush=True)
+
+    run_start = time.monotonic()
+
     for epoch in range(1, train_config.epochs + 1):
+        epoch_start = time.monotonic()
+        desc_train = f"epoch {epoch:>3}/{train_config.epochs} train"
+        desc_val = f"epoch {epoch:>3}/{train_config.epochs} val  "
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device=device,
             time_eps=train_config.time_eps, grad_clip_norm=train_config.grad_clip_norm,
             max_batches=train_config.max_train_batches,
+            desc=desc_train, disable_progress=disable_progress,
+            progress_min_interval=train_config.progress_min_interval,
         )
         val_loss = evaluate_model(
             model, val_loader, device=device, time_eps=train_config.time_eps,
             max_batches=train_config.max_val_batches,
+            desc=desc_val, disable_progress=disable_progress,
+            progress_min_interval=train_config.progress_min_interval,
         )
-        global_step += _effective_num_batches(train_loader, train_config.max_train_batches)
+        epoch_time = time.monotonic() - epoch_start
+        global_step += train_batches
 
-        record = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "global_step": global_step}
+        record = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "global_step": global_step,
+            "epoch_time_s": epoch_time,
+        }
         history.append(record)
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
@@ -324,7 +408,8 @@ def _run_fm_training(
             normalization=normalization, stage=stage, num_actions=num_actions,
             extra={"train_loss": train_loss, "val_loss": val_loss},
         )
-        if val_loss < best_val_loss:
+        is_best = val_loss < best_val_loss
+        if is_best:
             best_val_loss = val_loss
             save_checkpoint(
                 ckpt_dir / "best.pt", model, optimizer,
@@ -333,6 +418,18 @@ def _run_fm_training(
                 normalization=normalization, stage=stage, num_actions=num_actions,
                 extra={"train_loss": train_loss, "val_loss": val_loss},
             )
+
+        if train_config.progress:
+            elapsed = time.monotonic() - run_start
+            eta_s = (elapsed / epoch) * (train_config.epochs - epoch)
+            line = (
+                f"  epoch {epoch:>3}/{train_config.epochs} | "
+                f"train={train_loss:.4f} | val={val_loss:.4f} | "
+                f"best={best_val_loss:.4f}{' *' if is_best else '  '} | "
+                f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
+                f"eta={_fmt_time(eta_s)}"
+            )
+            print(line, file=sys.stderr, flush=True)
 
     summary = {
         "run_dir": str(run_dir),
@@ -345,9 +442,21 @@ def _run_fm_training(
         "best_val_loss": best_val_loss,
         "history": history,
         "device": str(device),
+        "total_time_s": time.monotonic() - run_start,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def _fmt_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:5.1f}s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes:d}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:d}h{minutes:02d}m"
 
 
 # ---------------------------------------------------------------------------
