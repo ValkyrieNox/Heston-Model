@@ -54,6 +54,9 @@ def test_generate_heston_dataset_writes_expected_files(tmp_path: Path) -> None:
     )
 
     assert metadata["split_sizes"] == {"train": 4, "val": 2, "test": 2}
+    assert metadata["dt"] == HestonParams().dt
+    assert metadata["s0"] == HestonParams().s0
+    assert metadata["v0"] == HestonParams().v0
     assert (tmp_path / "metadata.json").exists()
     for split, n_paths in [("train", 4), ("val", 2), ("test", 2)]:
         paths = np.load(tmp_path / f"{split}.npz")
