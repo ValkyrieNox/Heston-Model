@@ -521,6 +521,9 @@ def generate_heston_dataset(
             "target": "(v_{t+1}, r_t)",
         },
         "normalization": stats,
+        "v0": float(v0 if use_regimes else params.v0),
+        "s0": float(s0 if use_regimes else params.s0),
+        "dt": float(dt if use_regimes else params.dt),
     }
     if use_regimes:
         metadata["regime_switching"] = True
@@ -528,9 +531,6 @@ def generate_heston_dataset(
         metadata["transition_matrix"] = transition_matrix.tolist()
         metadata["initial_regime"] = int(initial_regime)
         metadata["num_actions"] = len(regimes)
-        metadata["v0"] = float(v0)
-        metadata["s0"] = float(s0)
-        metadata["dt"] = float(dt)
     else:
         metadata["regime_switching"] = False
         metadata["params"] = asdict(params)

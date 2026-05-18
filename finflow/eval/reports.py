@@ -1,0 +1,81 @@
+"""End-to-end report builder: stylized facts + distances + pricing."""
+
+from __future__ import annotations
+
+from typing import Any, Sequence
+
+import numpy as np
+
+from finflow.data import HestonParams
+from finflow.eval.distances import marginal_wasserstein_curve, path_wasserstein
+from finflow.eval.pricing import (
+    PricingComparison,
+    pricing_rmse_vs_carr_madan,
+)
+from finflow.eval.stylized_facts import (
+    StylizedFactReport,
+    compare_stylized_facts,
+    stylized_fact_report,
+)
+
+
+def build_full_report(
+    *,
+    real_returns: np.ndarray,
+    fake_returns: np.ndarray,
+    real_s_paths: np.ndarray | None = None,
+    fake_s_paths: np.ndarray | None = None,
+    params: HestonParams | None = None,
+    moneynesses: Sequence[float] = (0.85, 0.90, 0.95, 1.0, 1.05),
+    maturities: Sequence[float] = (0.25, 0.5, 1.0),
+    dt: float = 1.0 / 252.0,
+    pricing_r: float = 0.0,
+) -> dict[str, Any]:
+    """Compute the full V3 evaluation matrix.
+
+    Always returns the stylized-fact comparison and the per-step / total
+    Wasserstein distances on log-returns. If ``params`` and ``*_s_paths`` are
+    supplied, also returns the pricing RMSE vs Carr-Madan reference for the
+    generated paths.
+    """
+
+    real_returns = np.asarray(real_returns, dtype=np.float64)
+    fake_returns = np.asarray(fake_returns, dtype=np.float64)
+
+    real_facts: StylizedFactReport = stylized_fact_report(real_returns)
+    fake_facts: StylizedFactReport = stylized_fact_report(fake_returns)
+    comparison = compare_stylized_facts(real_facts, fake_facts)
+
+    marginal_w = marginal_wasserstein_curve(real_returns, fake_returns)
+    total_return_w = path_wasserstein(real_returns, fake_returns, reducer="sum")
+    abs_total_w = path_wasserstein(real_returns, fake_returns, reducer="abs_sum")
+
+    out: dict[str, Any] = {
+        "real_facts": real_facts.to_dict(),
+        "fake_facts": fake_facts.to_dict(),
+        "stylized_facts_comparison": comparison,
+        "distances": {
+            "marginal_wasserstein_mean": float(marginal_w.mean()),
+            "marginal_wasserstein_max": float(marginal_w.max()),
+            "marginal_wasserstein_curve": marginal_w.tolist(),
+            "total_return_wasserstein": float(total_return_w),
+            "abs_total_return_wasserstein": float(abs_total_w),
+        },
+    }
+
+    if params is not None and fake_s_paths is not None:
+        pricing: PricingComparison = pricing_rmse_vs_carr_madan(
+            fake_s_paths, dt=dt,
+            moneynesses=moneynesses, maturities=maturities,
+            params=params, r=pricing_r,
+        )
+        out["pricing_fake_vs_carr_madan"] = pricing.to_dict()
+        if real_s_paths is not None:
+            real_pricing: PricingComparison = pricing_rmse_vs_carr_madan(
+                real_s_paths, dt=dt,
+                moneynesses=moneynesses, maturities=maturities,
+                params=params, r=pricing_r,
+            )
+            out["pricing_real_vs_carr_madan"] = real_pricing.to_dict()
+
+    return out

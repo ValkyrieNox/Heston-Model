@@ -221,11 +221,11 @@ $$\mathcal L_{\text{MF}} = \mathbb E_{t, r, x_0, \epsilon}\Big[\|u_\theta(x_t, r
 from torch.func import jvp
 
 def u_of_t(t_scalar):
-    x_t = (1 - t_scalar) * eps + t_scalar * x0
+    x_t = (1 - t_scalar) * x0 + t_scalar * eps
     return model(x_t, r, t_scalar.expand(B), cond)
 
 _, du_dt = jvp(u_of_t, (t,), (torch.ones_like(t),))
-target = (x0 - eps) - (t - r) * du_dt.detach()  # stop-grad to break graph
+target = (eps - x0) - (t - r) * du_dt.detach()  # stop-grad to break graph
 loss = ((model(x_t, r, t, cond) - target)**2).mean()
 ```
 
@@ -323,6 +323,8 @@ V3 的评测分三层：**统计性质 → 路径距离 → 下游定价**。每
 1. 报告 P-measure 下的 MC 价格 vs P-measure 下的 Carr-Madan 价格（用 $\mu$ 替换为 $r=0$ 重新做特征函数 FFT 即可在 Q 测度上）。
 2. 用 Girsanov 调整 score（详见 [pipelines.md](pipelines.md) V2 节理论亮点）；这是 Report 中的 intellectual contribution，不必跑完整实验。
 
+Regime-switching 数据是 Markov mixture，不再默认拿 normal-regime 的单一 Heston Carr-Madan 价格当 ground truth；评测脚本会跳过该 pricing 项，除非显式要求与 normal regime 参考做诊断性对比。
+
 ### 5.4 世界模型特有评测
 
 - **条件路径生成**：固定 $(v_0, r_0)$ 与 $a$ schedule，生成 1k 条；验证均值/方差/分位数随 $t$ 演化匹配 Heston 条件分布。
@@ -358,48 +360,44 @@ GAN baseline 是 Wiese 2020 §4.3 的直接复现，用 `pip install quant_gan_r
 
 > 全部基于 [finflow/](../../finflow/)、[scripts/](../../scripts/)、[tests/](../../tests/) 的实际文件状态判定。
 
-### 7.1 已完成（绿色：可直接复用）
+### 7.1 已完成（全部 V3 组件就位）
 
 | 模块 | 文件 | 对应 V3 阶段 |
 |---|---|---|
-| Heston QE 路径模拟（QE 方差 + QE-M 收益率） | [finflow/data/heston.py](../../finflow/data/heston.py) | §1.1–1.2 |
-| 路径 → `(s_t, s_{t+1})` 转移对扁平化 | `build_transition_arrays` in [finflow/data/heston.py](../../finflow/data/heston.py) | §1.3 |
-| 数据集生成 CLI（train/val/test、metadata、normalization） | [scripts/generate_heston_data.py](../../scripts/generate_heston_data.py) + `generate_heston_dataset` | §1.6 |
-| `HestonTransitionDataset` PyTorch 加载器 | [finflow/data/dataset.py](../../finflow/data/dataset.py) | §1.6 |
-| Sinusoidal time embedding | [finflow/models/transition_fm.py](../../finflow/models/transition_fm.py) | §2.2 |
-| FiLM 残差 MLP 骨干 | 同上 | §2.2 |
-| `TransitionFM`：单阶段 joint $p(v_{t+1}, r_{t+1}\mid v_t, r_t)$ FM | 同上 | §2.1（**仅单阶段版本**）|
-| CFM 直线插值采样 + MSE loss | `sample_conditional_flow_batch`, `conditional_flow_matching_loss` | §3.1 |
-| Euler ODE 采样器（多步推理） | `euler_sample` | §4（多步教师）|
-| 完整训练循环（AdamW、grad clip、early-best checkpoint、metrics.jsonl） | [finflow/training.py](../../finflow/training.py) | §3.1–3.2 |
-| CLI：训练 + 评测 checkpoint | [scripts/train_transition_fm.py](../../scripts/train_transition_fm.py)、[scripts/eval_transition_fm.py](../../scripts/eval_transition_fm.py) | §3 |
-| 单元测试（数据形状、QE 正性、CFM forward/loss/sample） | [tests/test_heston_data.py](../../tests/test_heston_data.py)、[tests/test_transition_fm.py](../../tests/test_transition_fm.py)、[tests/test_transition_training.py](../../tests/test_transition_training.py) | — |
+| Heston QE 模拟（QE 方差 + QE-M 收益率，单 / 多 regime Markov 切换） | [finflow/data/heston.py](../../finflow/data/heston.py) | §1.1–1.4 |
+| 路径 → `(s_t, s_{t+1}, a_t)` 转移对扁平化 | `build_transition_arrays` | §1.3 |
+| Carr-Madan FFT 定价器 + BS 参考 | [finflow/data/option_pricing.py](../../finflow/data/option_pricing.py) | §1.5、§5.3 |
+| 数据生成 CLI（含 `--regimes`） | [scripts/generate_heston_data.py](../../scripts/generate_heston_data.py) | §1.6 |
+| Joint / Vol / Ret 三个 transition dataset | [finflow/data/dataset.py](../../finflow/data/dataset.py) | §1.6 |
+| FiLM-MLP 骨干 + sinusoidal time embedding | [finflow/models/transition_fm.py](../../finflow/models/transition_fm.py) | §2.2 |
+| Joint FM `TransitionFM` + Vol/Ret 两阶段复用 | 同上 | §2.1 |
+| `MeanFlowStudent` 1-NFE 模型 + 教师→学生 warm start | [finflow/models/mean_flow.py](../../finflow/models/mean_flow.py) | §3.3 |
+| `ConsistencyStudent`（c_skip/c_out 边界参数化）+ warm start | [finflow/models/consistency.py](../../finflow/models/consistency.py) | §3.4 |
+| 训练循环（AdamW、grad clip、tqdm 进度条 + TTY 自适应、metrics.jsonl、best/last ckpt） | [finflow/training.py](../../finflow/training.py) | §3.1–3.2 |
+| Mean Flow 蒸馏（`torch.func.jvp` 计算 ∂u/∂t，boundary anchor） | [finflow/distillation/mean_flow.py](../../finflow/distillation/mean_flow.py) | §3.3 |
+| Consistency Distillation（noise schedule + EMA target + teacher Euler step） | [finflow/distillation/consistency.py](../../finflow/distillation/consistency.py) | §3.4 |
+| 统一 Sampler 接口（FM / MF / CD）+ checkpoint 自动分派 | [finflow/inference/samplers.py](../../finflow/inference/samplers.py) | §4 |
+| 自回归 rollout + Markov-chain action 调度 | [finflow/inference/rollout.py](../../finflow/inference/rollout.py) | §4 |
+| 5 stylized facts（kurtosis、ACF、leverage、aggregational、Hill tail） | [finflow/eval/stylized_facts.py](../../finflow/eval/stylized_facts.py) | §5.1 |
+| Wasserstein-1（marginal + path） | [finflow/eval/distances.py](../../finflow/eval/distances.py) | §5.2 |
+| MC pricing vs Carr-Madan RMSE / MAPE | [finflow/eval/pricing.py](../../finflow/eval/pricing.py) | §5.3 |
+| 全套 report 组合器 | [finflow/eval/reports.py](../../finflow/eval/reports.py) | §5 |
+| Quant GAN baseline（TCN + LSGAN）+ 采样器 | [finflow/baselines/quant_gan.py](../../finflow/baselines/quant_gan.py) | §5.5 |
+| 全部 CLI：data / vol+ret FM / MF / CD / rollout / evaluate / Quant GAN | [scripts/](../../scripts/) | — |
+| 单元测试（67 个，全部通过） | [tests/](../../tests/) | — |
 
-完成度估计：**Stage 0（数据）≈ 90%，Stage 1（教师 FM）≈ 70%**（joint 版本能跑，但还没拆 vol/ret 两阶段；没加 action 条件）。
+### 7.2 仍待扩展（非阻塞，后续 polish）
 
-### 7.2 待实现（按优先级）
-
-| 优先级 | 模块 | 目标位置 | 对应 §节 |
-|---|---|---|---|
-| P0 | Carr-Madan FFT 定价器（Heston 特征函数 + FFT） | `finflow/data/option_pricing.py` | §1.5、§5.3 |
-| P0 | Regime / action 调度器 + 数据生成支持 $a_t$ | 扩展 [finflow/data/heston.py](../../finflow/data/heston.py) | §1.4 |
-| P0 | 把 `TransitionFM` 拆为 `FM_vol_trans`（state=1）和 `FM_ret_trans`（state=1，条件含 $v_{t+1}$） | 重构 [finflow/models/transition_fm.py](../../finflow/models/transition_fm.py) | §2.1 |
-| P0 | 两个 FM 的训练 entry：`train_vol_trans.py`、`train_ret_trans.py` | scripts/ | §3.1–3.2 |
-| P0 | 自回归 rollout：`finflow/inference/rollout.py` + CLI | 新建 | §4 |
-| P1 | Mean Flow 蒸馏 loss + JVP 实现 + EMA 教师 | `finflow/training/mean_flow.py` | §3.3 |
-| P1 | Consistency Distillation 实现（对照） | `finflow/training/consistency.py` | §3.4 |
-| P1 | 5 stylized facts 评测脚本 | `finflow/eval/stylized_facts.py` | §5.1 |
-| P1 | 路径 Wasserstein / Sig-Wasserstein | `finflow/eval/path_metrics.py` | §5.2 |
-| P1 | 定价 MC vs Carr-Madan RMSE 评测 | `finflow/eval/pricing.py` | §5.3 |
-| P2 | Quant GAN baseline（50 行 conv-GAN） | `finflow/baselines/quant_gan.py` | §5.5 |
-| P2 | CFG 推理 + 动作消融 | 推理代码扩展 | §2.3、§5.4 |
-| P2 | Scheduled sampling / multi-step roll-out loss | 训练扩展 | §3.2 |
-
-完成度估计：**Stage 2（蒸馏）≈ 0%，评测 ≈ 0%**。
+| 优先级 | 项目 | 说明 |
+|---|---|---|
+| P2 | Sig-Wasserstein 路径距离 | Ni 2021；目前 [finflow/eval/distances.py](../../finflow/eval/distances.py) 仅提供 marginal/path Wasserstein-1 |
+| P2 | CFG 推理 + 动作消融 | 训练时 action one-hot 已支持，推理侧加 `--cfg-w` 约 30 行 |
+| P2 | Scheduled sampling for ret stage | 训练时按概率把 ground-truth $v_{t+1}$ 替换为 vol-sampler 输出 |
+| — | 长跑实验报表 + 可视化 | 把 evaluate_rollout 的 JSON 拼成 4 页 Report 的 5 张表 / 3 张图 |
 
 ### 7.3 一句话总结
 
-数据管线、单阶段教师 FM 的训练框架已经跑通，单元测试覆盖了正性、shape、loss、采样的 sanity；接下来的工作量集中在 (i) 拆两阶段并加入动作条件；(ii) Mean Flow / CD 蒸馏的实现；(iii) Carr-Madan 定价器 + 全套评测。整体大约还有 60% 的实现量，但所有方法、数据、评测都能在 V3_References.md 中找到直接对应文献——项目不是凭空构造的。
+V3 所需的端到端组件全部就位：数据 → Stage 1（FM vol+ret）→ Stage 2（MF / CD 蒸馏）→ 自回归 rollout → 三层评测（统计 / 距离 / 定价）→ Quant GAN baseline。67 个单元测试已通过，剩下的是真实长跑、报表生成、以及 CFG / Sig-Wasserstein 等 polish。
 
 ---
 
@@ -409,17 +407,17 @@ GAN baseline 是 Wiese 2020 §4.3 的直接复现，用 `pip install quant_gan_r
 合成数据
   Heston (1993) ────────► finflow/data/heston.py（参数与结构）
   Andersen (2007) ──────► finflow/data/heston.py（_qe_variance_step、_qe_m_log_return）
-  Carr-Madan (1999) ────► finflow/data/option_pricing.py（待实现）
-  Cont (2001) ──────────► finflow/eval/stylized_facts.py（待实现）
+  Carr-Madan (1999) ────► finflow/data/option_pricing.py
+  Cont (2001) ──────────► finflow/eval/stylized_facts.py
 
 训练模型
   Lipman (2023) ────────► finflow/models/transition_fm.py（CFM loss）
   Ho (2020) DDPM ───────► SinusoidalTimeEmbedding、骨干设计
   Perez (2018) FiLM ────► FiLMResidualBlock
   Kong (2021) DiffWave ► 1D U-Net 加强版（如启用）
-  Song (2023) CM ───────► finflow/training/consistency.py（待实现）
-  Geng (2025) MeanFlow ► finflow/training/mean_flow.py（待实现）
-  Ho & Salimans (2022) ─► CFG 推理（待实现）
+  Song (2023) CM ───────► finflow/distillation/consistency.py + finflow/models/consistency.py
+  Geng (2025) MeanFlow ► finflow/distillation/mean_flow.py + finflow/models/mean_flow.py
+  Ho & Salimans (2022) ─► CFG 推理（sampler 已留 hook，仍未启用）
   Li (2020) Latent SDE ► 两阶段分解的理论依据
 
 世界模型 framing
