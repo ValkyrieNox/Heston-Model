@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from finflow.data import (
     DEFAULT_REGIMES,
@@ -82,3 +83,45 @@ def test_ret_trans_fm_smoke(tmp_path: Path) -> None:
     )
     assert eval_result["loss"] >= 0.0
     assert eval_result["stage"] == "ret"
+
+
+def test_ret_trans_fm_scheduled_sampling_smoke(tmp_path: Path) -> None:
+    data_dir, num_actions = _generate_smoke_data(tmp_path)
+    vol_summary = train_vol_trans_fm(
+        data_dir=data_dir,
+        output_dir=tmp_path / "runs_vol_sched",
+        run_name="vol_sched",
+        num_actions=num_actions,
+        model_config=TwoStageFMModelConfig(
+            state_dim=1, condition_dim=1 + num_actions,
+            hidden_dim=16, time_embedding_dim=8, num_blocks=2,
+        ),
+        train_config=TransitionFMTrainConfig(
+            **{**_SHARED_TRAIN_KW, "epochs": 1, "max_train_batches": 1}
+        ),
+    )
+    ret_summary = train_ret_trans_fm(
+        data_dir=data_dir,
+        output_dir=tmp_path / "runs_ret_sched",
+        run_name="ret_sched",
+        num_actions=num_actions,
+        model_config=TwoStageFMModelConfig(
+            state_dim=1, condition_dim=3 + num_actions,
+            hidden_dim=16, time_embedding_dim=8, num_blocks=2,
+        ),
+        train_config=TransitionFMTrainConfig(
+            **{
+                **_SHARED_TRAIN_KW,
+                "epochs": 2,
+                "max_train_batches": 1,
+                "scheduled_sampling_max_prob": 0.5,
+            }
+        ),
+        vol_sampler_checkpoint=vol_summary["checkpoints"]["best"],
+    )
+
+    history = ret_summary["history"]
+    assert history[0]["scheduled_sampling_prob"] == 0.25
+    assert history[-1]["scheduled_sampling_prob"] == 0.5
+    config = json.loads((Path(ret_summary["run_dir"]) / "config.json").read_text(encoding="utf-8"))
+    assert config["scheduled_sampling_enabled"] is True

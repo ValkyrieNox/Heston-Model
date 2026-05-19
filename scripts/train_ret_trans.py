@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Train V3 Stage 1b return transition kernel: p(r_{t+1} | v_{t+1}, v_t, r_t, a_t).
 
-Training uses teacher-forced ground-truth v_{t+1} from the Heston data; at
-inference time v_{t+1} is supplied by the Stage 1a sampler.
+By default training uses teacher-forced ground-truth v_{t+1} from the Heston
+data. With --vol-sampler-checkpoint, training gradually replaces v_{t+1} with
+Stage 1a sampler output to reduce the train/inference gap.
 """
 
 from __future__ import annotations
@@ -44,6 +45,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
+    parser.add_argument("--action-dropout-prob", type=float, default=0.1,
+                        help="drop action one-hot during training for CFG support")
+    parser.add_argument("--vol-sampler-checkpoint", type=Path, default=None,
+                        help="optional Stage 1a vol sampler checkpoint for scheduled sampling")
+    parser.add_argument("--scheduled-sampling-max-prob", type=float, default=0.5,
+                        help="max fraction of ret batches conditioned on sampled v_next")
+    parser.add_argument("--scheduled-sampling-start-epoch", type=int, default=1,
+                        help="first epoch where scheduled sampling can be active")
+    parser.add_argument("--scheduled-sampling-fm-steps", type=int, default=20,
+                        help="Euler steps when the vol sampler checkpoint is an FM teacher")
 
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--time-embedding-dim", type=int, default=64)
@@ -76,6 +87,12 @@ def main() -> None:
         log_every=args.log_every,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
+        action_dropout_prob=args.action_dropout_prob,
+        scheduled_sampling_max_prob=(
+            args.scheduled_sampling_max_prob if args.vol_sampler_checkpoint is not None else 0.0
+        ),
+        scheduled_sampling_start_epoch=args.scheduled_sampling_start_epoch,
+        scheduled_sampling_fm_steps=args.scheduled_sampling_fm_steps,
     )
     summary = train_ret_trans_fm(
         data_dir=args.data_dir,
@@ -84,6 +101,7 @@ def main() -> None:
         num_actions=num_actions,
         model_config=model_config,
         train_config=train_config,
+        vol_sampler_checkpoint=args.vol_sampler_checkpoint,
     )
     print(json.dumps(summary, indent=2))
 

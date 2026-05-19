@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-seed", type=int, default=0)
     parser.add_argument("--fm-n-steps", type=int, default=20,
                         help="ODE steps when a checkpoint is an FM teacher")
+    parser.add_argument("--cfg-w", type=float, default=0.0,
+                        help="classifier-free guidance weight over action conditioning")
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
 
@@ -101,6 +103,7 @@ def main() -> None:
         noise_seed=args.noise_seed,
         device=vol_loaded.sampler.device,
         constant_action=args.constant_action,
+        cfg_w=args.cfg_w,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +129,7 @@ def main() -> None:
         "normalization": normalization,
         "regime_actions": bool(args.regime_actions and num_actions > 1),
         "constant_action": bool(args.constant_action),
+        "cfg_w": args.cfg_w,
     }
     info_path = args.output.with_suffix(".json")
     info_path.write_text(json.dumps(info, indent=2), encoding="utf-8")

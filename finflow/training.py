@@ -22,7 +22,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import torch
@@ -82,6 +82,10 @@ class TransitionFMTrainConfig:
     max_val_batches: int | None = None
     progress: bool = True
     progress_min_interval: float = 0.2
+    action_dropout_prob: float = 0.0
+    scheduled_sampling_max_prob: float = 0.0
+    scheduled_sampling_start_epoch: int = 1
+    scheduled_sampling_fm_steps: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +231,7 @@ def train_one_epoch(
     desc: str = "train",
     disable_progress: bool = False,
     progress_min_interval: float = 0.2,
+    condition_transform: Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor] | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -240,6 +245,8 @@ def train_one_epoch(
     for batch in bar:
         condition = batch["condition"].to(device, non_blocking=True)
         target = batch["target"].to(device, non_blocking=True)
+        if condition_transform is not None:
+            condition = condition_transform(batch, condition)
         optimizer.zero_grad(set_to_none=True)
         loss = conditional_flow_matching_loss(
             model, condition=condition, target=target, time_eps=time_eps,
@@ -318,6 +325,10 @@ def _run_fm_training(
     stage: str,
     num_actions: int,
     config_blob_extra: dict[str, Any] | None = None,
+    train_condition_transform_factory: (
+        Callable[[int], tuple[Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor] | None, dict[str, Any]]]
+        | None
+    ) = None,
 ) -> dict[str, Any]:
     device = resolve_device(train_config.device)
     model = model.to(device)
@@ -374,12 +385,17 @@ def _run_fm_training(
         epoch_start = time.monotonic()
         desc_train = f"epoch {epoch:>3}/{train_config.epochs} train"
         desc_val = f"epoch {epoch:>3}/{train_config.epochs} val  "
+        condition_transform = None
+        epoch_extra: dict[str, Any] = {}
+        if train_condition_transform_factory is not None:
+            condition_transform, epoch_extra = train_condition_transform_factory(epoch)
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device=device,
             time_eps=train_config.time_eps, grad_clip_norm=train_config.grad_clip_norm,
             max_batches=train_config.max_train_batches,
             desc=desc_train, disable_progress=disable_progress,
             progress_min_interval=train_config.progress_min_interval,
+            condition_transform=condition_transform,
         )
         val_loss = evaluate_model(
             model, val_loader, device=device, time_eps=train_config.time_eps,
@@ -397,6 +413,7 @@ def _run_fm_training(
             "global_step": global_step,
             "epoch_time_s": epoch_time,
         }
+        record.update(epoch_extra)
         history.append(record)
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
@@ -406,7 +423,7 @@ def _run_fm_training(
             epoch=epoch, global_step=global_step, best_val_loss=best_val_loss,
             model_config=model_config_dict, train_config=asdict(train_config),
             normalization=normalization, stage=stage, num_actions=num_actions,
-            extra={"train_loss": train_loss, "val_loss": val_loss},
+            extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
         )
         is_best = val_loss < best_val_loss
         if is_best:
@@ -416,7 +433,7 @@ def _run_fm_training(
                 epoch=epoch, global_step=global_step, best_val_loss=best_val_loss,
                 model_config=model_config_dict, train_config=asdict(train_config),
                 normalization=normalization, stage=stage, num_actions=num_actions,
-                extra={"train_loss": train_loss, "val_loss": val_loss},
+                extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
             )
 
         if train_config.progress:
@@ -425,6 +442,7 @@ def _run_fm_training(
             line = (
                 f"  epoch {epoch:>3}/{train_config.epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
+                f"{_format_epoch_extra(epoch_extra)}"
                 f"best={best_val_loss:.4f}{' *' if is_best else '  '} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}"
@@ -457,6 +475,12 @@ def _fmt_time(seconds: float) -> str:
         return f"{minutes:d}m{sec:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours:d}h{minutes:02d}m"
+
+
+def _format_epoch_extra(epoch_extra: dict[str, Any]) -> str:
+    if "scheduled_sampling_prob" not in epoch_extra:
+        return ""
+    return f"sched={float(epoch_extra['scheduled_sampling_prob']):.3f} | "
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +610,7 @@ def build_vol_datasets(
     data_dir: str | Path,
     normalization: dict[str, float],
     num_actions: int,
+    train_action_dropout_prob: float = 0.0,
 ) -> dict[str, HestonVolTransitionDataset]:
     data_dir = Path(data_dir)
     return {
@@ -595,6 +620,7 @@ def build_vol_datasets(
             log_v_mean=normalization["log_v_mean"],
             log_v_std=normalization["log_v_std"],
             num_actions=num_actions,
+            action_dropout_prob=train_action_dropout_prob if split == "train" else 0.0,
         )
         for split in ("train", "val", "test")
     }
@@ -620,7 +646,10 @@ def train_vol_trans_fm(
     if num_actions is None:
         num_actions = load_num_actions(data_dir)
     normalization = load_normalization(data_dir)
-    datasets = build_vol_datasets(data_dir, normalization, num_actions)
+    datasets = build_vol_datasets(
+        data_dir, normalization, num_actions,
+        train_action_dropout_prob=train_config.action_dropout_prob,
+    )
 
     if model_config is None:
         model_config = TwoStageFMModelConfig(
@@ -660,6 +689,7 @@ def build_ret_datasets(
     data_dir: str | Path,
     normalization: dict[str, float],
     num_actions: int,
+    train_action_dropout_prob: float = 0.0,
 ) -> dict[str, HestonRetTransitionDataset]:
     data_dir = Path(data_dir)
     return {
@@ -671,9 +701,91 @@ def build_ret_datasets(
             return_mean=normalization["return_mean"],
             return_std=normalization["return_std"],
             num_actions=num_actions,
+            action_dropout_prob=train_action_dropout_prob if split == "train" else 0.0,
         )
         for split in ("train", "val", "test")
     }
+
+
+def _scheduled_sampling_prob_for_epoch(
+    epoch: int,
+    total_epochs: int,
+    max_prob: float,
+    start_epoch: int,
+) -> float:
+    if max_prob <= 0.0:
+        return 0.0
+    if not 0.0 <= max_prob <= 1.0:
+        raise ValueError("scheduled_sampling_max_prob must be in [0, 1]")
+    if start_epoch <= 0:
+        raise ValueError("scheduled_sampling_start_epoch must be positive")
+    if epoch < start_epoch:
+        return 0.0
+    active_epochs = max(total_epochs - start_epoch + 1, 1)
+    progress = (epoch - start_epoch + 1) / active_epochs
+    return min(max_prob, max_prob * progress)
+
+
+def _make_ret_scheduled_sampling_factory(
+    *,
+    vol_sampler_checkpoint: str | Path,
+    device: torch.device,
+    num_actions: int,
+    train_config: TransitionFMTrainConfig,
+):
+    from finflow.inference.samplers import load_sampler_from_checkpoint
+
+    loaded = load_sampler_from_checkpoint(
+        vol_sampler_checkpoint,
+        device=device,
+        fm_n_steps=train_config.scheduled_sampling_fm_steps,
+    )
+    if loaded.stage != "vol":
+        raise ValueError(
+            f"vol_sampler_checkpoint must load a vol-stage sampler, got stage='{loaded.stage}'"
+        )
+    if loaded.num_actions != num_actions:
+        raise ValueError(
+            f"vol sampler num_actions={loaded.num_actions} does not match ret data num_actions={num_actions}"
+        )
+    expected_condition_dim = 1 + num_actions
+    if loaded.sampler.condition_dim != expected_condition_dim:
+        raise ValueError(
+            f"vol sampler condition_dim must be {expected_condition_dim}, "
+            f"got {loaded.sampler.condition_dim}"
+        )
+
+    def factory(epoch: int):
+        prob = _scheduled_sampling_prob_for_epoch(
+            epoch,
+            train_config.epochs,
+            train_config.scheduled_sampling_max_prob,
+            train_config.scheduled_sampling_start_epoch,
+        )
+
+        def transform(
+            batch: dict[str, torch.Tensor],
+            condition: torch.Tensor,
+        ) -> torch.Tensor:
+            if prob <= 0.0:
+                return condition
+            vol_condition = torch.cat([condition[:, 1:2], condition[:, 3:]], dim=1)
+            with torch.no_grad():
+                sampled_log_v_next = loaded.sampler.sample(vol_condition).to(
+                    device=condition.device,
+                    dtype=condition.dtype,
+                )
+            mask = (torch.rand(condition.shape[0], 1, device=condition.device) < prob)
+            updated = condition.clone()
+            updated[:, 0:1] = torch.where(mask, sampled_log_v_next, updated[:, 0:1])
+            return updated
+
+        return transform, {
+            "scheduled_sampling_prob": prob,
+            "scheduled_sampling_checkpoint": str(Path(vol_sampler_checkpoint).resolve()),
+        }
+
+    return factory
 
 
 def train_ret_trans_fm(
@@ -683,11 +795,14 @@ def train_ret_trans_fm(
     num_actions: int | None = None,
     model_config: TwoStageFMModelConfig | None = None,
     train_config: TransitionFMTrainConfig | None = None,
+    vol_sampler_checkpoint: str | Path | None = None,
 ) -> dict[str, Any]:
     """Train Stage 1b: ``p(r_{t+1} | v_{t+1}, v_t, r_t, a_t)``.
 
-    Training uses teacher-forced ground-truth ``v_{t+1}`` from the data. At
-    inference time the Stage 1a sampler supplies ``v_{t+1}``.
+    By default training uses teacher-forced ground-truth ``v_{t+1}`` from the
+    data. If ``vol_sampler_checkpoint`` is provided, scheduled sampling replaces
+    a linearly increasing fraction of each training batch's ``v_{t+1}`` with
+    Stage 1a sampler output.
     """
 
     train_config = train_config or TransitionFMTrainConfig()
@@ -696,7 +811,10 @@ def train_ret_trans_fm(
     if num_actions is None:
         num_actions = load_num_actions(data_dir)
     normalization = load_normalization(data_dir)
-    datasets = build_ret_datasets(data_dir, normalization, num_actions)
+    datasets = build_ret_datasets(
+        data_dir, normalization, num_actions,
+        train_action_dropout_prob=train_config.action_dropout_prob,
+    )
 
     if model_config is None:
         model_config = TwoStageFMModelConfig(
@@ -714,6 +832,20 @@ def train_ret_trans_fm(
 
     run_dir = build_run_dir(output_dir, run_name=run_name, prefix="ret_trans_fm")
     model = TransitionFM(**asdict(model_config))
+    resolved_device = resolve_device(train_config.device)
+    train_condition_transform_factory = None
+    scheduled_extra: dict[str, Any] = {"data_dir": str(Path(data_dir).resolve())}
+    if vol_sampler_checkpoint is not None:
+        train_condition_transform_factory = _make_ret_scheduled_sampling_factory(
+            vol_sampler_checkpoint=vol_sampler_checkpoint,
+            device=resolved_device,
+            num_actions=num_actions,
+            train_config=train_config,
+        )
+        scheduled_extra.update({
+            "vol_sampler_checkpoint": str(Path(vol_sampler_checkpoint).resolve()),
+            "scheduled_sampling_enabled": train_config.scheduled_sampling_max_prob > 0.0,
+        })
     return _run_fm_training(
         model=model,
         datasets=datasets,
@@ -723,7 +855,8 @@ def train_ret_trans_fm(
         model_config_dict=asdict(model_config),
         stage="ret",
         num_actions=num_actions,
-        config_blob_extra={"data_dir": str(Path(data_dir).resolve())},
+        config_blob_extra=scheduled_extra,
+        train_condition_transform_factory=train_condition_transform_factory,
     )
 
 

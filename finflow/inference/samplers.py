@@ -31,8 +31,15 @@ class Sampler:
     condition_dim: int
     kind: str  # "fm" | "mf" | "cd"
     device: torch.device
+    num_actions: int | None
 
-    def sample(self, condition: torch.Tensor, *, noise: torch.Tensor | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        condition: torch.Tensor,
+        *,
+        noise: torch.Tensor | None = None,
+        cfg_w: float = 0.0,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -44,12 +51,37 @@ def _ensure_noise(noise, batch, state_dim, device, dtype) -> torch.Tensor:
     return noise.to(device=device, dtype=dtype)
 
 
+def _unconditional_condition(
+    condition: torch.Tensor,
+    num_actions: int | None,
+    cfg_w: float,
+) -> torch.Tensor | None:
+    if cfg_w == 0.0:
+        return None
+    if cfg_w < 0.0:
+        raise ValueError("cfg_w must be non-negative")
+    if num_actions is None or num_actions <= 0:
+        raise ValueError("sampler needs num_actions to use CFG")
+    if condition.shape[1] < num_actions:
+        raise ValueError(
+            f"condition dim {condition.shape[1]} is smaller than num_actions={num_actions}"
+        )
+    unconditional = condition.clone()
+    unconditional[:, -num_actions:] = 0.0
+    return unconditional
+
+
 class FMTeacherSampler(Sampler):
     """Multi-step Euler ODE sampler over a trained Flow Matching teacher."""
 
     kind = "fm"
 
-    def __init__(self, model: TransitionFM, n_steps: int = 20) -> None:
+    def __init__(
+        self,
+        model: TransitionFM,
+        n_steps: int = 20,
+        num_actions: int | None = None,
+    ) -> None:
         if n_steps <= 0:
             raise ValueError("n_steps must be positive")
         self.model = model
@@ -57,17 +89,29 @@ class FMTeacherSampler(Sampler):
         self.state_dim = model.state_dim
         self.condition_dim = model.condition_dim
         self.device = next(model.parameters()).device
+        self.num_actions = num_actions
 
     @torch.no_grad()
-    def sample(self, condition: torch.Tensor, *, noise: torch.Tensor | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        condition: torch.Tensor,
+        *,
+        noise: torch.Tensor | None = None,
+        cfg_w: float = 0.0,
+    ) -> torch.Tensor:
         condition = condition.to(self.device)
+        unconditional = _unconditional_condition(condition, self.num_actions, cfg_w)
         batch = condition.shape[0]
         dtype = condition.dtype
         x = _ensure_noise(noise, batch, self.state_dim, self.device, dtype)
         dt = 1.0 / self.n_steps
         for step in range(self.n_steps):
             tau = torch.full((batch,), step * dt, device=self.device, dtype=dtype)
-            x = x + dt * self.model(x_tau=x, tau=tau, condition=condition)
+            velocity = self.model(x_tau=x, tau=tau, condition=condition)
+            if unconditional is not None:
+                velocity_uncond = self.model(x_tau=x, tau=tau, condition=unconditional)
+                velocity = (1.0 + cfg_w) * velocity - cfg_w * velocity_uncond
+            x = x + dt * velocity
         return x
 
 
@@ -80,21 +124,32 @@ class MeanFlowSampler(Sampler):
 
     kind = "mf"
 
-    def __init__(self, model: MeanFlowStudent) -> None:
+    def __init__(self, model: MeanFlowStudent, num_actions: int | None = None) -> None:
         self.model = model
         self.state_dim = model.state_dim
         self.condition_dim = model.condition_dim
         self.device = next(model.parameters()).device
+        self.num_actions = num_actions
 
     @torch.no_grad()
-    def sample(self, condition: torch.Tensor, *, noise: torch.Tensor | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        condition: torch.Tensor,
+        *,
+        noise: torch.Tensor | None = None,
+        cfg_w: float = 0.0,
+    ) -> torch.Tensor:
         condition = condition.to(self.device)
+        unconditional = _unconditional_condition(condition, self.num_actions, cfg_w)
         batch = condition.shape[0]
         dtype = condition.dtype
         x = _ensure_noise(noise, batch, self.state_dim, self.device, dtype)
         r = torch.zeros(batch, device=self.device, dtype=dtype)
         t = torch.ones(batch, device=self.device, dtype=dtype)
         u = self.model(x, r, t, condition)
+        if unconditional is not None:
+            u_uncond = self.model(x, r, t, unconditional)
+            u = (1.0 + cfg_w) * u - cfg_w * u_uncond
         return x - u
 
 
@@ -103,7 +158,12 @@ class ConsistencySampler(Sampler):
 
     kind = "cd"
 
-    def __init__(self, model: ConsistencyStudent, time_eps: float = 1e-3) -> None:
+    def __init__(
+        self,
+        model: ConsistencyStudent,
+        time_eps: float = 1e-3,
+        num_actions: int | None = None,
+    ) -> None:
         if not 0.0 <= time_eps < 1.0:
             raise ValueError("time_eps must be in [0, 1)")
         self.model = model
@@ -111,15 +171,27 @@ class ConsistencySampler(Sampler):
         self.condition_dim = model.condition_dim
         self.time_eps = float(time_eps)
         self.device = next(model.parameters()).device
+        self.num_actions = num_actions
 
     @torch.no_grad()
-    def sample(self, condition: torch.Tensor, *, noise: torch.Tensor | None = None) -> torch.Tensor:
+    def sample(
+        self,
+        condition: torch.Tensor,
+        *,
+        noise: torch.Tensor | None = None,
+        cfg_w: float = 0.0,
+    ) -> torch.Tensor:
         condition = condition.to(self.device)
+        unconditional = _unconditional_condition(condition, self.num_actions, cfg_w)
         batch = condition.shape[0]
         dtype = condition.dtype
         x = _ensure_noise(noise, batch, self.state_dim, self.device, dtype)
         t = torch.full((batch,), self.time_eps, device=self.device, dtype=dtype)
-        return self.model(x, t, condition)
+        out = self.model(x, t, condition)
+        if unconditional is not None:
+            out_uncond = self.model(x, t, unconditional)
+            out = (1.0 + cfg_w) * out - cfg_w * out_uncond
+        return out
 
 
 @dataclass
@@ -179,7 +251,7 @@ def load_sampler_from_checkpoint(
         )
         model.load_state_dict(ckpt["model_state"])
         model.to(resolved_device).eval()
-        sampler: Sampler = MeanFlowSampler(model)
+        sampler: Sampler = MeanFlowSampler(model, num_actions=num_actions)
     elif kind == "consistency":
         model = ConsistencyStudent(
             state_dim=int(config["state_dim"]),
@@ -190,7 +262,7 @@ def load_sampler_from_checkpoint(
         )
         model.load_state_dict(ckpt["model_state"])
         model.to(resolved_device).eval()
-        sampler = ConsistencySampler(model, time_eps=consistency_time_eps)
+        sampler = ConsistencySampler(model, time_eps=consistency_time_eps, num_actions=num_actions)
     elif kind == "fm":
         model = TransitionFM(
             state_dim=int(config["state_dim"]),
@@ -201,7 +273,7 @@ def load_sampler_from_checkpoint(
         )
         model.load_state_dict(ckpt["model_state"])
         model.to(resolved_device).eval()
-        sampler = FMTeacherSampler(model, n_steps=fm_n_steps)
+        sampler = FMTeacherSampler(model, n_steps=fm_n_steps, num_actions=num_actions)
     else:
         raise ValueError(f"unknown sampler kind '{kind}'")
 
