@@ -1,7 +1,7 @@
 # V3 实施流程文档：基于 Flow Matching 的自回归金融世界模型
 
 > 生成日期：2026-05-17
-> 范围：依据 [pipelines.md](pipelines.md) 中的 V3 方案与 [V3_References.md](V3_References.md) 中的文献清单，给出从数据 → 训练 → 评测的端到端实施流程，并对照当前 `finflow/` 代码库标记完成度。
+> 范围：依据 [02_pipelines.md](02_pipelines.md) 中的 V3 方案与 [03_V3_References.md](03_V3_References.md) 中的文献清单，给出从数据 → 训练 → 评测的端到端实施流程，并对照当前 `finflow/` 代码库标记完成度。
 > 一句话定义：用 Flow Matching 学习 Heston 随机过程的一步转移核 $p(s_{t+1}\mid s_t, a_t)$，用 Mean Flow 蒸馏为 1-NFE 单步生成器，自回归滚动 252 步后用 Heston 闭式解评测分布与定价误差。
 > 项目根：[../../](../../)；现有源码：[finflow/](../../finflow/)、[scripts/](../../scripts/)、[tests/](../../tests/)。
 
@@ -9,7 +9,7 @@
 
 ## 0. 项目的"有据可依"总览
 
-| 维度 | 我们的做法 | 直接对应的文献（V3_References.md 段号）|
+| 维度 | 我们的做法 | 直接对应的文献（03_V3_References.md 段号）|
 |---|---|---|
 | 合成数据 SDE | Heston 随机波动率模型 | Heston 1993, RFS（§4.1） |
 | 数值格式 | Andersen QE 方差更新 + QE-M 收益率 | Andersen 2007, JCF（§4.1） |
@@ -28,7 +28,7 @@
 | 定价评测 | 15 个 (K,T) 网格点的 RMSE vs Carr-Madan | Carr-Madan 1999 + Cont 2001 评测范式（§4.1、§4.4）|
 | 理论拼图 | Probability Flow ODE、Girsanov 测度变换 | Song 2021 Score SDE、Karatzas-Shreve、Shreve（§七） |
 
-凡是 V3 用到的"合成数据 / 训练模型 / 评测手段"在 V3_References.md 里都有显式对应条目；本文档每一节都会再指回这些文献条目，确保 Report / 答辩可以直接引用。
+凡是 V3 用到的"合成数据 / 训练模型 / 评测手段"在 03_V3_References.md 里都有显式对应条目；本文档每一节都会再指回这些文献条目，确保 Report / 答辩可以直接引用。
 
 ---
 
@@ -321,7 +321,7 @@ V3 的评测分三层：**统计性质 → 路径距离 → 下游定价**。每
 
 **注意 P vs Q 测度**：训练在 P 测度上（含 $\mu$ 漂移），定价需要 Q 测度。两种处理：
 1. 报告 P-measure 下的 MC 价格 vs P-measure 下的 Carr-Madan 价格（用 $\mu$ 替换为 $r=0$ 重新做特征函数 FFT 即可在 Q 测度上）。
-2. 用 Girsanov 调整 score（详见 [pipelines.md](pipelines.md) V2 节理论亮点）；这是 Report 中的 intellectual contribution，不必跑完整实验。
+2. 用 Girsanov 调整 score（详见 [02_pipelines.md](02_pipelines.md) V2 节理论亮点）；这是 Report 中的 intellectual contribution，不必跑完整实验。
 
 Regime-switching 数据是 Markov mixture，不再默认拿 normal-regime 的单一 Heston Carr-Madan 价格当 ground truth；评测脚本会跳过该 pricing 项，除非显式要求与 normal regime 参考做诊断性对比。
 
@@ -443,10 +443,10 @@ V3 所需的端到端组件全部就位：数据 → Stage 1（FM vol+ret）→ 
 
 ---
 
-## 9. 与 pipelines.md 中 V1/V2 的关系
+## 9. 与 02_pipelines.md 中 V1/V2 的关系
 
 - V1 的 CD vs MF 对比 → 作为 V3 的 §3.4 对照实验保留。
 - V2 的"先 v 再 r\|v"两阶段分解 → V3 在转移核层面直接采用（§2.1）。
 - V3 真正新增的是把生成对象从"整条路径"变成"一步转移"，加入 action $a_t$，把自回归 rollout 作为推理范式。
 
-[pipelines.md](pipelines.md) 末尾原本建议"V1+V2 结合，V3 留作 Future Work"——本项目选择直接走 V3，是因为：(a) `TransitionFM` 已经把转移核框架搭好，(b) Mean Flow + 世界模型这两个 framing 在课程评分上比单纯 V1/V2 更紧扣"World Model + One-step"双主题。代价是误差累积评测（§5.4）必须做，否则审稿/答辩会直接问 252 步会不会发散。
+[02_pipelines.md](02_pipelines.md) 末尾原本建议"V1+V2 结合，V3 留作 Future Work"——本项目选择直接走 V3，是因为：(a) `TransitionFM` 已经把转移核框架搭好，(b) Mean Flow + 世界模型这两个 framing 在课程评分上比单纯 V1/V2 更紧扣"World Model + One-step"双主题。代价是误差累积评测（§5.4）必须做，否则审稿/答辩会直接问 252 步会不会发散。

@@ -1,10 +1,10 @@
 # FinFlow Bench — 完整项目实施方案
 
-> 生成日期：2026-05-13。基于 discussion.md 的评估与修订。
+> 生成日期：2026-05-13。基于 00_discussion.md 的评估与修订。
 
 ---
 
-## 零、对 discussion.md 的评估
+## 零、对 00_discussion.md 的评估
 
 ### 合理的部分（保留）
 1. **方向判断正确**：FlowLOB 确实是 red ocean（TRADES/LOBDIF/Painting-the-Market 已饱和），换到"方法学对比 + Heston testbed"的 framing 是正确决策
