@@ -21,6 +21,8 @@ Design docs:
   data / model / evaluation choice
 - [idea/2/04_v3_implementation.md](idea/2/04_v3_implementation.md) — end-to-end V3
   plan, code-progress index, literature reverse-lookup
+- [idea/2/11_P1Implementation.md](idea/2/11_P1Implementation.md) — P1
+  methodology hooks and verification notes
 
 ## Layout
 
@@ -34,7 +36,7 @@ finflow/
   eval/                    # stylized facts + distances + pricing + report builder
   baselines/               # Quant GAN (TCN + Lambert-W + WGAN-GP)
 scripts/                   # CLI entry points (one per command)
-tests/                     # full pytest suite (76 tests)
+tests/                     # full pytest suite (82 tests)
 ```
 
 ## End-to-end workflow
@@ -54,21 +56,29 @@ python3 scripts/price_heston_grid.py \
 # --- 2) Stage 1: train the two FM teachers --------------------------------
 python3 scripts/train_vol_trans.py \
   --data-dir data/heston_v3 --output-dir runs/vol_fm \
-  --batch-size 512 --epochs 20 --lr 3e-4
+  --batch-size 512 --epochs 20 --lr 3e-4 \
+  --action-dropout-prob 0.1
 
 python3 scripts/train_ret_trans.py \
   --data-dir data/heston_v3 --output-dir runs/ret_fm \
-  --batch-size 512 --epochs 20 --lr 3e-4
+  --batch-size 512 --epochs 20 --lr 3e-4 \
+  --action-dropout-prob 0.1 \
+  --vol-sampler-checkpoint runs/vol_fm/<run>/checkpoints/best.pt \
+  --scheduled-sampling-max-prob 0.5
 
 # --- 3) Stage 2: 1-NFE distillation ---------------------------------------
 # Mean Flow students (recommended)
 python3 scripts/distill_mean_flow.py --stage vol \
   --teacher-checkpoint runs/vol_fm/<run>/checkpoints/best.pt \
-  --data-dir data/heston_v3 --epochs 15 --batch-size 512
+  --data-dir data/heston_v3 --epochs 15 --batch-size 512 \
+  --boundary-prob-start 0.5 --boundary-prob-end 0.1 \
+  --identity-residual-eval
 
 python3 scripts/distill_mean_flow.py --stage ret \
   --teacher-checkpoint runs/ret_fm/<run>/checkpoints/best.pt \
-  --data-dir data/heston_v3 --epochs 15 --batch-size 512
+  --data-dir data/heston_v3 --epochs 15 --batch-size 512 \
+  --boundary-prob-start 0.5 --boundary-prob-end 0.1 \
+  --identity-residual-eval
 
 # Consistency Distillation students (comparison baseline)
 python3 scripts/distill_consistency.py --stage vol \
@@ -87,7 +97,8 @@ python3 scripts/rollout.py \
   --ret-checkpoint runs/mf_ret_distill/<run>/checkpoints/best.pt \
   --data-dir data/heston_v3 \
   --output runs/rollout_mf.npz \
-  --n-paths 10000 --n-steps 252 --regime-actions
+  --n-paths 10000 --n-steps 252 --regime-actions \
+  --cfg-w 2.0
 
 # Same script also works with FM teacher or CD checkpoints (auto-detected).
 
@@ -101,6 +112,7 @@ python3 scripts/evaluate_rollout.py \
   --fake runs/rollout_mf.npz \
   --mc-oracle data/heston_v3/mc_oracle.npz \
   --output runs/eval_mf.json \
+  --signature-depth 3 \
   --moneynesses 0.85 0.9 0.95 1.0 1.05 \
   --maturities 0.25 0.5 1.0
 
@@ -168,8 +180,9 @@ Carr-Madan accuracy
 (low-vol-of-vol → BS limit + monotonicity + ATM Heston), V3 vol/ret datasets,
 single-stage + two-stage FM trainers, Mean Flow model + JVP-based loss +
 distillation smoke, Consistency model + distillation smoke, all three samplers,
-autoregressive rollout, the 5 stylized facts, Wasserstein distances, MC pricing
-vs Carr-Madan / MC oracle, and Quant GAN forward + train + sample.
+CFG rollout, autoregressive rollout, the 5 stylized facts, Wasserstein and
+signature distances, MC pricing vs Carr-Madan / MC oracle, and Quant GAN
+forward + train + sample.
 
 ## Status
 
@@ -177,6 +190,7 @@ All V3 components defined in
 [idea/2/04_v3_implementation.md](idea/2/04_v3_implementation.md) are implemented:
 data + Carr-Madan, Stage 1 teachers, Mean Flow + Consistency distillation,
 unified samplers + autoregressive rollout, the full evaluation suite, and a
-Quant GAN baseline. Pending V3 future work: signature-based path distances,
-classifier-free guidance, scheduled-sampling during ret training, and longer
-empirical sweeps reported in the writeup.
+Quant GAN baseline. P1 methodology hooks are also implemented: Mean Flow
+boundary curriculum, ret-stage scheduled sampling, classifier-free guidance,
+and Sig-Wasserstein reporting. Pending V3 future work: longer empirical
+sweeps, per-regime reporting, visualizations, and writeup polish.
