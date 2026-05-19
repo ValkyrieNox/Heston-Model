@@ -158,3 +158,45 @@ def pricing_rmse_vs_carr_madan(
         maturities=mc["maturities"],
         strikes=mc["strikes"],
     )
+
+
+def pricing_rmse_vs_mc_oracle(
+    s_paths: np.ndarray,
+    oracle_s_paths: np.ndarray,
+    *,
+    dt: float,
+    moneynesses: Sequence[float],
+    maturities: Sequence[float],
+    s0: float | None = None,
+    r: float = 0.0,
+) -> PricingComparison:
+    """Compare generated-path MC prices against an independent MC oracle grid."""
+
+    s_paths = np.asarray(s_paths, dtype=np.float64)
+    oracle_s_paths = np.asarray(oracle_s_paths, dtype=np.float64)
+    if s_paths.ndim != 2 or oracle_s_paths.ndim != 2:
+        raise ValueError("s_paths and oracle_s_paths must have shape [n_paths, n_steps + 1]")
+    s0_resolved = float(s0) if s0 is not None else float(s_paths[0, 0])
+    mc = mc_call_prices_grid(
+        s_paths,
+        dt=dt,
+        moneynesses=moneynesses,
+        maturities=maturities,
+        s0=s0_resolved,
+        r=r,
+    )
+    oracle = mc_call_prices_grid(
+        oracle_s_paths,
+        dt=dt,
+        moneynesses=moneynesses,
+        maturities=maturities,
+        s0=s0_resolved,
+        r=r,
+    )
+    return pricing_rmse_vs_reference(
+        mc_prices=mc["prices"],
+        reference_prices=oracle["prices"],
+        moneynesses=mc["moneynesses"],
+        maturities=mc["maturities"],
+        strikes=mc["strikes"],
+    )

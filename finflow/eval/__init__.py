@@ -8,6 +8,7 @@ from finflow.eval.distances import (
 from finflow.eval.pricing import (
     mc_call_prices_grid,
     pricing_rmse_vs_carr_madan,
+    pricing_rmse_vs_mc_oracle,
     pricing_rmse_vs_reference,
 )
 from finflow.eval.reports import build_full_report
@@ -32,6 +33,7 @@ __all__ = [
     "mc_call_prices_grid",
     "path_wasserstein",
     "pricing_rmse_vs_carr_madan",
+    "pricing_rmse_vs_mc_oracle",
     "pricing_rmse_vs_reference",
     "stylized_fact_report",
     "tail_index_hill",
