@@ -110,6 +110,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=None,
                         help="limit number of paths used from each side")
+    parser.add_argument("--signature-depth", type=int, default=3,
+                        help="truncated signature depth for Sig-Wasserstein; set 0 to disable")
     return parser.parse_args()
 
 
@@ -165,6 +167,7 @@ def main() -> None:
         maturities=args.maturities,
         dt=dt,
         pricing_r=pricing_r or 0.0,
+        signature_depth=args.signature_depth or None,
     )
     if pricing_skipped_reason is not None:
         report["pricing_skipped"] = pricing_skipped_reason
