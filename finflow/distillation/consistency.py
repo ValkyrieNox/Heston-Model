@@ -2,18 +2,23 @@
 
 For adjacent points on the same FM ODE trajectory we enforce::
 
-    f_student(x_{t_{n+1}}, t_{n+1}, c) == sg( f_target(x_{t_n}, t_n, c) )
+    f_student(x_{t_n}, t_n, c) == sg( f_target(x_{t_{n+1}}, t_{n+1}, c) )
 
 where ``f_target`` is the EMA of ``f_student`` and ``x_{t_n}`` is obtained by
 one teacher Euler step from ``x_{t_{n+1}}`` toward ``t_n``::
 
     x_{t_n} = x_{t_{n+1}} - (t_{n+1} - t_n) * v_teacher(x_{t_{n+1}}, t_{n+1}, c)
+
+The project uses the FM convention ``t=0`` = noise and ``t=1`` = data, so the
+cleaner endpoint is ``t_{n+1}``. The noisy-side student must therefore match
+the cleaner-side EMA target, not the other way around.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import math
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -70,12 +75,67 @@ class ConsistencyDistillConfig:
     warm_start: bool = True
     progress: bool = True
     progress_min_interval: float = 0.2
+    curriculum_kind: Literal["fixed", "ict"] = "ict"
+    n_min: int = 10
+    n_max: int = 160
+    huber_c: float = 0.03
+    karras_s0: float = -2.0
+    time_sampling: Literal["uniform", "lognormal"] = "lognormal"
 
 
 def _schedule(n_discretization: int, time_eps: float, device, dtype) -> torch.Tensor:
     """Uniform schedule on ``[time_eps, 1 - time_eps]`` with ``n_discretization+1`` points."""
 
     return torch.linspace(time_eps, 1.0 - time_eps, n_discretization + 1, device=device, dtype=dtype)
+
+
+def _curriculum_n(config: ConsistencyDistillConfig, epoch: int, total_epochs: int) -> int:
+    """Resolve the iCT discretization count for the current epoch."""
+
+    if config.curriculum_kind == "fixed":
+        return int(config.n_discretization)
+    if config.n_min <= 0 or config.n_max <= 0:
+        raise ValueError("n_min and n_max must be positive")
+    if config.n_max < config.n_min:
+        raise ValueError("n_max must be >= n_min")
+    if total_epochs <= 1:
+        progress = 0.0
+    else:
+        progress = (epoch - 1) / max(total_epochs - 1, 1)
+    ratio = config.n_max / config.n_min
+    n = round(config.n_min * (ratio ** progress))
+    return int(min(max(n, config.n_min), config.n_max))
+
+
+def _curriculum_ema_decay(config: ConsistencyDistillConfig, n_discretization: int) -> float:
+    """Resolve EMA decay; iCT uses a Karras-style decay that grows with N."""
+
+    if config.curriculum_kind == "fixed":
+        return float(config.ema_decay)
+    decay = math.exp(config.karras_s0 * math.log(2.0) / max(n_discretization, 1))
+    return float(min(max(decay, 0.0), 0.999999))
+
+
+def _pseudo_huber_loss(pred: torch.Tensor, target: torch.Tensor, c: float) -> torch.Tensor:
+    if c <= 0:
+        raise ValueError("huber_c must be positive")
+    diff = pred - target
+    return (torch.sqrt(diff.square() + c * c) - c).mean()
+
+
+def _sample_interval_indices(
+    batch_size: int,
+    n_segments: int,
+    device: torch.device,
+    time_sampling: Literal["uniform", "lognormal"],
+) -> torch.Tensor:
+    if time_sampling == "uniform":
+        return torch.randint(0, n_segments, (batch_size,), device=device)
+    if time_sampling == "lognormal":
+        sigma = torch.exp(torch.randn(batch_size, device=device))
+        unit_t = sigma / (1.0 + sigma)
+        return torch.clamp((unit_t * n_segments).long(), min=0, max=n_segments - 1)
+    raise ValueError(f"unknown time_sampling '{time_sampling}'")
 
 
 def consistency_distill_step(
@@ -85,6 +145,9 @@ def consistency_distill_step(
     condition: torch.Tensor,
     target: torch.Tensor,
     schedule: torch.Tensor,
+    *,
+    huber_c: float | None = None,
+    time_sampling: Literal["uniform", "lognormal"] = "uniform",
 ) -> torch.Tensor:
     """Single Consistency Distillation training step (loss only)."""
 
@@ -99,7 +162,7 @@ def consistency_distill_step(
     noise = torch.randn_like(target)
 
     # Pick a random index n in {0, ..., n_segments - 1} per sample.
-    n_idx = torch.randint(0, n_segments, (batch_size,), device=device)
+    n_idx = _sample_interval_indices(batch_size, n_segments, device, time_sampling)
     t_next = schedule[n_idx + 1]  # shape [B]
     t_curr = schedule[n_idx]      # shape [B]
 
@@ -109,15 +172,18 @@ def consistency_distill_step(
     # Construct x at t_next via straight-line CFM interpolation.
     x_next = (1.0 - t_next_view) * noise + t_next_view * target
 
-    # Teacher Euler step toward t_curr (one step backwards in t).
+    # Teacher Euler step toward t_curr (one step backwards in t). Since this
+    # repo's FM time runs noise->data, t_next is the cleaner endpoint. Train
+    # the noisier student call at t_curr to match the cleaner EMA target.
     with torch.no_grad():
         v_teacher = teacher(x_tau=x_next, tau=t_next, condition=condition)
         x_curr_hat = x_next - (t_next_view - t_curr_view) * v_teacher
-        # Target value from EMA student.
-        target_val = target_net(x_curr_hat, t_curr, condition)
+        target_val = target_net(x_next, t_next, condition)
 
-    pred = student(x_next, t_next, condition)
-    return F.mse_loss(pred, target_val)
+    pred = student(x_curr_hat, t_curr, condition)
+    if huber_c is None:
+        return F.mse_loss(pred, target_val)
+    return _pseudo_huber_loss(pred, target_val, huber_c)
 
 
 def _ema_update(target_net: torch.nn.Module, source_net: torch.nn.Module, decay: float) -> None:
@@ -136,6 +202,8 @@ def _train_one_epoch_consistency(
     device: torch.device,
     *,
     ema_decay: float,
+    huber_c: float | None,
+    time_sampling: Literal["uniform", "lognormal"],
     grad_clip_norm: float,
     max_batches: int | None,
     disable_progress: bool,
@@ -158,6 +226,7 @@ def _train_one_epoch_consistency(
         optimizer.zero_grad(set_to_none=True)
         loss = consistency_distill_step(
             student, target_net, teacher, condition, target, schedule,
+            huber_c=huber_c, time_sampling=time_sampling,
         )
         loss.backward()
         if grad_clip_norm > 0:
@@ -181,6 +250,8 @@ def _evaluate_consistency(
     schedule: torch.Tensor,
     device: torch.device,
     *,
+    huber_c: float | None,
+    time_sampling: Literal["uniform", "lognormal"],
     max_batches: int | None,
     disable_progress: bool,
     progress_min_interval: float,
@@ -202,6 +273,7 @@ def _evaluate_consistency(
             target = batch["target"].to(device)
             loss = consistency_distill_step(
                 student, target_net, teacher, condition, target, schedule,
+                huber_c=huber_c, time_sampling=time_sampling,
             )
             bs = condition.shape[0]
             total += float(loss.item()) * bs
@@ -288,8 +360,10 @@ def train_consistency_distill(
         num_workers=distill_config.num_workers, device=device,
     )
 
-    schedule = _schedule(
-        distill_config.n_discretization, distill_config.time_eps,
+    initial_n = _curriculum_n(distill_config, 1, distill_config.epochs)
+    initial_ema_decay = _curriculum_ema_decay(distill_config, initial_n)
+    initial_schedule = _schedule(
+        initial_n, distill_config.time_eps,
         device=device, dtype=torch.float32,
     )
 
@@ -307,7 +381,7 @@ def train_consistency_distill(
         "warm_started_params": warm_copied,
         "normalization": normalization,
         "data_dir": str(Path(data_dir).resolve()),
-        "schedule": schedule.cpu().tolist(),
+        "initial_schedule": initial_schedule.cpu().tolist(),
     }
     (run_dir / "config.json").write_text(json.dumps(config_blob, indent=2), encoding="utf-8")
 
@@ -319,7 +393,9 @@ def train_consistency_distill(
         header = (
             f"[finflow] cd_distill stage={stage} | run={run_dir.name} | device={device} | "
             f"params={n_params/1e3:.1f}k | warm_start={warm_copied} tensors | "
-            f"N={distill_config.n_discretization} ema={distill_config.ema_decay} | "
+            f"curriculum={distill_config.curriculum_kind} N={initial_n}"
+            f"{'' if distill_config.curriculum_kind == 'fixed' else f'->{distill_config.n_max}'} "
+            f"ema={initial_ema_decay:.6f} | "
             f"train={len(datasets['train'])} ({train_batches} batch x {distill_config.batch_size}) | "
             f"val={len(datasets['val'])} ({val_batches} batch) | epochs={distill_config.epochs}"
         )
@@ -332,11 +408,25 @@ def train_consistency_distill(
 
     for epoch in range(1, distill_config.epochs + 1):
         epoch_start = time.monotonic()
+        n_discretization = _curriculum_n(distill_config, epoch, distill_config.epochs)
+        ema_decay = _curriculum_ema_decay(distill_config, n_discretization)
+        schedule = _schedule(
+            n_discretization, distill_config.time_eps,
+            device=device, dtype=torch.float32,
+        )
+        huber_c = distill_config.huber_c if distill_config.curriculum_kind == "ict" else None
+        time_sampling = (
+            distill_config.time_sampling
+            if distill_config.curriculum_kind == "ict"
+            else "uniform"
+        )
         desc_train = f"epoch {epoch:>3}/{distill_config.epochs} train"
         desc_val = f"epoch {epoch:>3}/{distill_config.epochs} val  "
         train_loss = _train_one_epoch_consistency(
             student, target_net, teacher, train_loader, optimizer, schedule, device,
-            ema_decay=distill_config.ema_decay,
+            ema_decay=ema_decay,
+            huber_c=huber_c,
+            time_sampling=time_sampling,
             grad_clip_norm=distill_config.grad_clip_norm,
             max_batches=distill_config.max_train_batches,
             disable_progress=disable_progress,
@@ -345,6 +435,8 @@ def train_consistency_distill(
         )
         val_loss = _evaluate_consistency(
             student, target_net, teacher, val_loader, schedule, device,
+            huber_c=huber_c,
+            time_sampling=time_sampling,
             max_batches=distill_config.max_val_batches,
             disable_progress=disable_progress,
             progress_min_interval=distill_config.progress_min_interval,
@@ -357,6 +449,10 @@ def train_consistency_distill(
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "n_discretization": n_discretization,
+            "ema_decay": ema_decay,
+            "huber_c": huber_c,
+            "time_sampling": time_sampling,
             "global_step": global_step,
             "epoch_time_s": epoch_time,
         }
@@ -377,8 +473,11 @@ def train_consistency_distill(
                 "warm_started_params": warm_copied,
                 "kind": "consistency",
                 "model_state_kind": "ema",
-                "ema_decay": distill_config.ema_decay,
-                "n_discretization": distill_config.n_discretization,
+                "ema_decay": ema_decay,
+                "n_discretization": n_discretization,
+                "curriculum_kind": distill_config.curriculum_kind,
+                "huber_c": huber_c,
+                "time_sampling": time_sampling,
             },
         )
         if is_best:
@@ -395,8 +494,11 @@ def train_consistency_distill(
                     "warm_started_params": warm_copied,
                     "kind": "consistency",
                     "model_state_kind": "ema",
-                    "ema_decay": distill_config.ema_decay,
-                    "n_discretization": distill_config.n_discretization,
+                    "ema_decay": ema_decay,
+                    "n_discretization": n_discretization,
+                    "curriculum_kind": distill_config.curriculum_kind,
+                    "huber_c": huber_c,
+                    "time_sampling": time_sampling,
                 },
             )
 
@@ -406,6 +508,7 @@ def train_consistency_distill(
             print(
                 f"  epoch {epoch:>3}/{distill_config.epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
+                f"N={n_discretization} ema={ema_decay:.6f} | "
                 f"best={best_val:.4f}{' *' if is_best else '  '} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}",
