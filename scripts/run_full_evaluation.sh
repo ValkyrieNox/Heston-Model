@@ -127,6 +127,7 @@ for spec in sys.argv[2:]:
         fmt(distances.get("marginal_wasserstein_mean")),
         fmt(distances.get("marginal_wasserstein_max")),
         fmt(distances.get("total_return_wasserstein")),
+        fmt((distances.get("signature_wasserstein") or {}).get("mean")),
         pricing_ref,
         fmt(pricing.get("rmse_overall")),
         fmt(pricing.get("mape_overall")),
@@ -136,8 +137,8 @@ for spec in sys.argv[2:]:
 lines = [
     "# Full Evaluation Summary",
     "",
-    "| Model | Marginal W1 mean | Marginal W1 max | Total-return W1 | Pricing ref | Pricing RMSE | Pricing MAPE | JSON |",
-    "|---|---:|---:|---:|---|---:|---:|---|",
+    "| Model | Marginal W1 mean | Marginal W1 max | Total-return W1 | Sig-W1 mean | Pricing ref | Pricing RMSE | Pricing MAPE | JSON |",
+    "|---|---:|---:|---:|---:|---|---:|---:|---|",
 ]
 for row in rows:
     lines.append("| " + " | ".join(row) + " |")

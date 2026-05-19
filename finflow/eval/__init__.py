@@ -12,6 +12,11 @@ from finflow.eval.pricing import (
     pricing_rmse_vs_reference,
 )
 from finflow.eval.reports import build_full_report
+from finflow.eval.signatures import (
+    returns_to_time_cumsum_paths,
+    signature_features,
+    signature_wasserstein,
+)
 from finflow.eval.stylized_facts import (
     StylizedFactReport,
     aggregational_kurtosis,
@@ -35,6 +40,9 @@ __all__ = [
     "pricing_rmse_vs_carr_madan",
     "pricing_rmse_vs_mc_oracle",
     "pricing_rmse_vs_reference",
+    "returns_to_time_cumsum_paths",
+    "signature_features",
+    "signature_wasserstein",
     "stylized_fact_report",
     "tail_index_hill",
     "wasserstein_1d",

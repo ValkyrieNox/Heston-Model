@@ -13,6 +13,7 @@ from finflow.eval.pricing import (
     pricing_rmse_vs_carr_madan,
     pricing_rmse_vs_mc_oracle,
 )
+from finflow.eval.signatures import signature_wasserstein
 from finflow.eval.stylized_facts import (
     StylizedFactReport,
     compare_stylized_facts,
@@ -32,6 +33,7 @@ def build_full_report(
     maturities: Sequence[float] = (0.25, 0.5, 1.0),
     dt: float = 1.0 / 252.0,
     pricing_r: float = 0.0,
+    signature_depth: int | None = 3,
 ) -> dict[str, Any]:
     """Compute the full V3 evaluation matrix.
 
@@ -52,6 +54,11 @@ def build_full_report(
     marginal_w = marginal_wasserstein_curve(real_returns, fake_returns)
     total_return_w = path_wasserstein(real_returns, fake_returns, reducer="sum")
     abs_total_w = path_wasserstein(real_returns, fake_returns, reducer="abs_sum")
+    sig_w = (
+        signature_wasserstein(real_returns, fake_returns, depth=signature_depth)
+        if signature_depth is not None
+        else None
+    )
 
     out: dict[str, Any] = {
         "real_facts": real_facts.to_dict(),
@@ -65,6 +72,8 @@ def build_full_report(
             "abs_total_return_wasserstein": float(abs_total_w),
         },
     }
+    if sig_w is not None:
+        out["distances"]["signature_wasserstein"] = sig_w
 
     if params is not None and fake_s_paths is not None:
         pricing: PricingComparison = pricing_rmse_vs_carr_madan(

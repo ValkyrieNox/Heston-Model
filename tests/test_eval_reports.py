@@ -25,6 +25,8 @@ def test_build_full_report_runs_with_pricing():
     assert "pricing_fake_vs_carr_madan" in report
     assert "pricing_real_vs_carr_madan" in report
     assert np.isfinite(report["distances"]["total_return_wasserstein"])
+    assert "signature_wasserstein" in report["distances"]
+    assert report["distances"]["signature_wasserstein"]["depth"] == 3
 
 
 def test_build_full_report_no_pricing_when_params_missing():
