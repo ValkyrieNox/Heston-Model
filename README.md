@@ -1,7 +1,7 @@
 # FinFlow — V3 Heston World-Model Pipeline
 
 A complete V3 implementation of the autoregressive financial world model
-described in [idea/2/pipelines.md](idea/2/pipelines.md):
+described in [idea/2/02_pipelines.md](idea/2/02_pipelines.md):
 
 - **Data**: Andersen-QE Heston with optional 3-regime Markov mixture and a
   Carr-Madan FFT pricer for ground-truth option prices.
@@ -12,14 +12,14 @@ described in [idea/2/pipelines.md](idea/2/pipelines.md):
 - **Inference**: unified samplers (FM teacher / MF / CD) and an autoregressive
   rollout that uses any pair of vol+ret samplers interchangeably.
 - **Evaluation**: 5 Cont (2001) stylized facts + marginal/path Wasserstein-1 +
-  Carr-Madan vs MC pricing RMSE / MAPE for single-regime Heston data.
-- **Baseline**: a minimal Quant GAN (TCN + LSGAN, Wiese 2020-style).
+  Carr-Madan or MC-oracle pricing RMSE / MAPE.
+- **Baseline**: Quant GAN with Lambert-W preprocessing and WGAN-GP.
 
 Design docs:
-- [idea/2/pipelines.md](idea/2/pipelines.md) — V1 / V2 / V3 framing
-- [idea/2/V3_References.md](idea/2/V3_References.md) — literature backing every
+- [idea/2/02_pipelines.md](idea/2/02_pipelines.md) — V1 / V2 / V3 framing
+- [idea/2/03_V3_References.md](idea/2/03_V3_References.md) — literature backing every
   data / model / evaluation choice
-- [idea/2/v3_implementation.md](idea/2/v3_implementation.md) — end-to-end V3
+- [idea/2/04_v3_implementation.md](idea/2/04_v3_implementation.md) — end-to-end V3
   plan, code-progress index, literature reverse-lookup
 
 ## Layout
@@ -32,9 +32,9 @@ finflow/
   distillation/            # Mean Flow + Consistency distillation trainers
   inference/               # unified samplers + autoregressive rollout
   eval/                    # stylized facts + distances + pricing + report builder
-  baselines/               # Quant GAN (TCN + LSGAN)
+  baselines/               # Quant GAN (TCN + Lambert-W + WGAN-GP)
 scripts/                   # CLI entry points (one per command)
-tests/                     # full pytest suite (67 tests)
+tests/                     # full pytest suite (76 tests)
 ```
 
 ## End-to-end workflow
@@ -73,11 +73,13 @@ python3 scripts/distill_mean_flow.py --stage ret \
 # Consistency Distillation students (comparison baseline)
 python3 scripts/distill_consistency.py --stage vol \
   --teacher-checkpoint runs/vol_fm/<run>/checkpoints/best.pt \
-  --data-dir data/heston_v3 --epochs 15 --n-discretization 18
+  --data-dir data/heston_v3 --epochs 15 --curriculum-kind ict \
+  --n-min 10 --n-max 160 --huber-c 0.03
 
 python3 scripts/distill_consistency.py --stage ret \
   --teacher-checkpoint runs/ret_fm/<run>/checkpoints/best.pt \
-  --data-dir data/heston_v3 --epochs 15 --n-discretization 18
+  --data-dir data/heston_v3 --epochs 15 --curriculum-kind ict \
+  --n-min 10 --n-max 160 --huber-c 0.03
 
 # --- 4) autoregressive rollout --------------------------------------------
 python3 scripts/rollout.py \
@@ -90,21 +92,28 @@ python3 scripts/rollout.py \
 # Same script also works with FM teacher or CD checkpoints (auto-detected).
 
 # --- 5) evaluation --------------------------------------------------------
+python3 scripts/generate_mc_oracle.py \
+  --data-dir data/heston_v3 --output data/heston_v3/mc_oracle.npz \
+  --n-paths 100000
+
 python3 scripts/evaluate_rollout.py \
   --real data/heston_v3/test.npz \
   --fake runs/rollout_mf.npz \
+  --mc-oracle data/heston_v3/mc_oracle.npz \
   --output runs/eval_mf.json \
   --moneynesses 0.85 0.9 0.95 1.0 1.05 \
   --maturities 0.25 0.5 1.0
 
 # Regime-switching data has no single-Heston Carr-Madan reference, so this
-# command reports statistical/distance metrics and marks pricing as skipped.
-# Drop --regimes during data generation for a closed-form pricing RMSE run.
+# command reports statistical/distance metrics and marks pricing as skipped
+# unless you pass --mc-oracle path/to/oracle.npz. Drop --regimes during data
+# generation for a closed-form Carr-Madan pricing RMSE run.
 
 # --- 6) Quant GAN baseline ------------------------------------------------
 python3 scripts/train_quant_gan.py \
   --data-dir data/heston_v3 --output-dir runs/quant_gan \
-  --seq-len 252 --epochs 20
+  --seq-len 252 --epochs 30 --d-steps-per-g 5 \
+  --gradient-penalty-weight 10 --lambert-w-delta 0.1
 
 python3 scripts/sample_quant_gan.py \
   --checkpoint runs/quant_gan/<run>/checkpoints/best.pt \
@@ -114,6 +123,8 @@ python3 scripts/evaluate_rollout.py \
   --real data/heston_v3/test.npz \
   --fake runs/quant_gan_paths.npz \
   --output runs/eval_quant_gan.json
+
+scripts/run_full_evaluation.sh runs data/heston_v3/test.npz runs/evaluation
 ```
 
 `num_actions` is auto-read from `metadata.json` at every step. Drop `--regimes`
@@ -152,17 +163,18 @@ loader (`load_sampler_from_checkpoint`) auto-dispatches the right sampler
 python3 -m pytest tests/
 ```
 
-Covers: Heston QE shape / positivity, regime simulation, Carr-Madan accuracy
+Covers: Heston QE shape / positivity, regime simulation, MC-oracle generation,
+Carr-Madan accuracy
 (low-vol-of-vol → BS limit + monotonicity + ATM Heston), V3 vol/ret datasets,
 single-stage + two-stage FM trainers, Mean Flow model + JVP-based loss +
 distillation smoke, Consistency model + distillation smoke, all three samplers,
 autoregressive rollout, the 5 stylized facts, Wasserstein distances, MC pricing
-vs Carr-Madan for single-regime data, and Quant GAN forward + train + sample.
+vs Carr-Madan / MC oracle, and Quant GAN forward + train + sample.
 
 ## Status
 
 All V3 components defined in
-[idea/2/v3_implementation.md](idea/2/v3_implementation.md) are implemented:
+[idea/2/04_v3_implementation.md](idea/2/04_v3_implementation.md) are implemented:
 data + Carr-Madan, Stage 1 teachers, Mean Flow + Consistency distillation,
 unified samplers + autoregressive rollout, the full evaluation suite, and a
 Quant GAN baseline. Pending V3 future work: signature-based path distances,
