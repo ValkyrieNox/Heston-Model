@@ -38,6 +38,24 @@ def test_build_full_report_no_pricing_when_params_missing():
     assert "distances" in report
 
 
+def test_build_full_report_with_mc_oracle_pricing():
+    real = simulate_heston_qe(n_paths=128, n_steps=64, seed=4)
+    fake = simulate_heston_qe(n_paths=128, n_steps=64, seed=5)
+    oracle = simulate_heston_qe(n_paths=128, n_steps=64, seed=6)
+    report = build_full_report(
+        real_returns=real["log_returns"],
+        fake_returns=fake["log_returns"],
+        real_s_paths=real["s_paths"],
+        fake_s_paths=fake["s_paths"],
+        oracle_s_paths=oracle["s_paths"],
+        moneynesses=(0.95, 1.0),
+        maturities=(0.1, 0.2),
+        dt=1.0 / 252.0,
+    )
+    assert "pricing_fake_vs_mc_oracle" in report
+    assert "pricing_real_vs_mc_oracle" in report
+
+
 def test_evaluate_rollout_metadata_dt_reads_single_regime_params():
     metadata = {
         "n_steps": 10,

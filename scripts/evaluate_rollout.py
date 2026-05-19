@@ -36,6 +36,15 @@ def _load_returns_and_paths(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return returns, s_paths
 
 
+def _load_s_paths(npz_path: Path) -> np.ndarray:
+    arr = np.load(npz_path)
+    if "s_paths" not in arr.files:
+        raise ValueError(f"{npz_path} must contain s_paths")
+    s_paths = np.asarray(arr["s_paths"], dtype=np.float64)
+    arr.close()
+    return s_paths
+
+
 def _metadata_dt(metadata: dict) -> float:
     n_steps = int(metadata.get("n_steps", 252))
     fallback = 1.0 / n_steps
@@ -81,6 +90,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=None,
                         help="metadata source (defaults to --real's parent)")
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--mc-oracle", type=Path, default=None,
+                        help="independent oracle npz containing s_paths for MC price reference")
     parser.add_argument("--moneynesses", nargs="+", type=float,
                         default=[0.85, 0.90, 0.95, 1.00, 1.05])
     parser.add_argument("--maturities", nargs="+", type=float,
@@ -112,32 +123,43 @@ def main() -> None:
     if args.skip_pricing:
         params = None
         pricing_skipped_reason = "disabled by --skip-pricing"
-    elif metadata.get("regime_switching") and not args.force_regime_pricing:
+    elif metadata.get("regime_switching") and args.mc_oracle is None and not args.force_regime_pricing:
         params = None
         pricing_skipped_reason = (
             "regime-switching data has no single-Heston Carr-Madan reference; "
-            "use --force-regime-pricing to compare against normal regime only"
+            "use --mc-oracle for MC reference or --force-regime-pricing to "
+            "compare against normal regime only"
         )
     else:
-        params = _normal_params_from_metadata(metadata, dt)
+        params = None if metadata.get("regime_switching") else _normal_params_from_metadata(metadata, dt)
+        if metadata.get("regime_switching") and args.force_regime_pricing:
+            params = _normal_params_from_metadata(metadata, dt)
     pricing_r = args.pricing_r
     if pricing_r is None and params is not None:
         pricing_r = float(params.mu)
 
     real_returns, real_s = _load_returns_and_paths(args.real)
     fake_returns, fake_s = _load_returns_and_paths(args.fake)
+    oracle_s = (
+        _load_s_paths(args.mc_oracle)
+        if args.mc_oracle is not None and not args.skip_pricing
+        else None
+    )
 
     if args.limit is not None:
         real_returns = real_returns[: args.limit]
         real_s = real_s[: args.limit]
         fake_returns = fake_returns[: args.limit]
         fake_s = fake_s[: args.limit]
+        if oracle_s is not None:
+            oracle_s = oracle_s[: args.limit]
 
     report = build_full_report(
         real_returns=real_returns,
         fake_returns=fake_returns,
         real_s_paths=real_s,
         fake_s_paths=fake_s,
+        oracle_s_paths=oracle_s,
         params=params,
         moneynesses=args.moneynesses,
         maturities=args.maturities,

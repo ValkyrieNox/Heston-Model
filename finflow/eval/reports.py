@@ -11,6 +11,7 @@ from finflow.eval.distances import marginal_wasserstein_curve, path_wasserstein
 from finflow.eval.pricing import (
     PricingComparison,
     pricing_rmse_vs_carr_madan,
+    pricing_rmse_vs_mc_oracle,
 )
 from finflow.eval.stylized_facts import (
     StylizedFactReport,
@@ -25,6 +26,7 @@ def build_full_report(
     fake_returns: np.ndarray,
     real_s_paths: np.ndarray | None = None,
     fake_s_paths: np.ndarray | None = None,
+    oracle_s_paths: np.ndarray | None = None,
     params: HestonParams | None = None,
     moneynesses: Sequence[float] = (0.85, 0.90, 0.95, 1.0, 1.05),
     maturities: Sequence[float] = (0.25, 0.5, 1.0),
@@ -36,7 +38,8 @@ def build_full_report(
     Always returns the stylized-fact comparison and the per-step / total
     Wasserstein distances on log-returns. If ``params`` and ``*_s_paths`` are
     supplied, also returns the pricing RMSE vs Carr-Madan reference for the
-    generated paths.
+    generated paths. If ``oracle_s_paths`` is supplied, additionally compares
+    generated and real paths against that independent MC oracle.
     """
 
     real_returns = np.asarray(real_returns, dtype=np.float64)
@@ -77,5 +80,26 @@ def build_full_report(
                 params=params, r=pricing_r,
             )
             out["pricing_real_vs_carr_madan"] = real_pricing.to_dict()
+
+    if oracle_s_paths is not None and fake_s_paths is not None:
+        oracle_pricing: PricingComparison = pricing_rmse_vs_mc_oracle(
+            fake_s_paths,
+            oracle_s_paths,
+            dt=dt,
+            moneynesses=moneynesses,
+            maturities=maturities,
+            r=pricing_r,
+        )
+        out["pricing_fake_vs_mc_oracle"] = oracle_pricing.to_dict()
+        if real_s_paths is not None:
+            real_oracle_pricing: PricingComparison = pricing_rmse_vs_mc_oracle(
+                real_s_paths,
+                oracle_s_paths,
+                dt=dt,
+                moneynesses=moneynesses,
+                maturities=maturities,
+                r=pricing_r,
+            )
+            out["pricing_real_vs_mc_oracle"] = real_oracle_pricing.to_dict()
 
     return out

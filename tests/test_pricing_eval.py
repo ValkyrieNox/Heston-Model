@@ -1,7 +1,12 @@
 import numpy as np
 
 from finflow.data import HestonParams, simulate_heston_qe
-from finflow.eval import mc_call_prices_grid, pricing_rmse_vs_carr_madan, pricing_rmse_vs_reference
+from finflow.eval import (
+    mc_call_prices_grid,
+    pricing_rmse_vs_carr_madan,
+    pricing_rmse_vs_mc_oracle,
+    pricing_rmse_vs_reference,
+)
 
 
 def test_mc_call_prices_grid_shapes_and_positivity():
@@ -39,6 +44,20 @@ def test_pricing_rmse_vs_reference_zero_on_identical():
         moneynesses=np.array([0.9, 1.0, 1.1]),
         maturities=np.array([0.25, 1.0]),
         strikes=np.array([90, 100, 110]),
+    )
+    assert cmp.rmse_overall == 0.0
+    assert cmp.mape_overall == 0.0
+
+
+def test_pricing_rmse_vs_mc_oracle_zero_on_same_paths():
+    arrays = simulate_heston_qe(n_paths=128, n_steps=64, seed=4)
+    cmp = pricing_rmse_vs_mc_oracle(
+        arrays["s_paths"],
+        arrays["s_paths"].copy(),
+        dt=1.0 / 252.0,
+        moneynesses=(0.95, 1.0, 1.05),
+        maturities=(0.1, 0.2),
+        r=0.0,
     )
     assert cmp.rmse_overall == 0.0
     assert cmp.mape_overall == 0.0
