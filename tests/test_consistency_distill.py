@@ -13,12 +13,29 @@ from finflow.distillation import (
     train_consistency_distill,
 )
 from finflow.distillation.consistency import _schedule
+from finflow.distillation.consistency import _curriculum_ema_decay, _curriculum_n
 from finflow.models import ConsistencyStudent, TransitionFM
 from finflow.training import (
     TransitionFMTrainConfig,
     TwoStageFMModelConfig,
     train_ret_trans_fm,
 )
+
+
+class _SpyConsistency(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.seen_t: torch.Tensor | None = None
+
+    def forward(self, x, t, condition):
+        self.seen_t = t.detach().clone()
+        return self.scale * x
+
+
+class _ZeroTeacher(torch.nn.Module):
+    def forward(self, x_tau, tau, condition):
+        return torch.zeros_like(x_tau)
 
 
 def test_consistency_distill_step_runs_and_is_scalar():
@@ -40,6 +57,33 @@ def test_consistency_distill_step_runs_and_is_scalar():
     assert torch.isfinite(loss)
     loss.backward()
     assert any(p.grad is not None for p in student.parameters())
+
+
+def test_consistency_distill_step_matches_noisier_student_to_cleaner_target():
+    torch.manual_seed(1)
+    student = _SpyConsistency()
+    target_net = _SpyConsistency()
+    for p in target_net.parameters():
+        p.requires_grad_(False)
+
+    schedule = _schedule(8, time_eps=1e-3, device=torch.device("cpu"), dtype=torch.float32)
+    cond = torch.randn(16, 4)
+    target = torch.randn(16, 1)
+    loss = consistency_distill_step(student, target_net, _ZeroTeacher(), cond, target, schedule)
+
+    assert loss.ndim == 0
+    assert student.seen_t is not None
+    assert target_net.seen_t is not None
+    assert torch.all(student.seen_t < target_net.seen_t)
+
+
+def test_consistency_ict_curriculum_increases_n_and_ema():
+    cfg = ConsistencyDistillConfig(teacher_checkpoint="unused", n_min=10, n_max=160)
+    n1 = _curriculum_n(cfg, epoch=1, total_epochs=4)
+    n4 = _curriculum_n(cfg, epoch=4, total_epochs=4)
+    assert n1 == 10
+    assert n4 == 160
+    assert _curriculum_ema_decay(cfg, n1) < _curriculum_ema_decay(cfg, n4)
 
 
 def _generate_smoke_data(tmp_path: Path):

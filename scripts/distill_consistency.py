@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--n-discretization", type=int, default=18)
     parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--curriculum-kind", choices=("fixed", "ict"), default="ict")
+    parser.add_argument("--n-min", type=int, default=10)
+    parser.add_argument("--n-max", type=int, default=160)
+    parser.add_argument("--huber-c", type=float, default=0.03)
+    parser.add_argument("--karras-s0", type=float, default=-2.0)
+    parser.add_argument("--time-sampling", choices=("uniform", "lognormal"), default="lognormal")
     parser.add_argument("--no-warm-start", action="store_true")
 
     parser.add_argument("--hidden-dim", type=int, default=None)
@@ -81,6 +87,12 @@ def main() -> None:
         max_val_batches=args.max_val_batches,
         n_discretization=args.n_discretization,
         ema_decay=args.ema_decay,
+        curriculum_kind=args.curriculum_kind,
+        n_min=args.n_min,
+        n_max=args.n_max,
+        huber_c=args.huber_c,
+        karras_s0=args.karras_s0,
+        time_sampling=args.time_sampling,
         warm_start=not args.no_warm_start,
     )
 
