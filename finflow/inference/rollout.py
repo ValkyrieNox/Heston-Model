@@ -98,6 +98,7 @@ def autoregressive_rollout(
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
     constant_action: bool = False,
+    cfg_w: float = 0.0,
 ) -> RolloutResult:
     """Roll out ``n_paths`` autoregressive trajectories of length ``n_steps``.
 
@@ -126,6 +127,8 @@ def autoregressive_rollout(
         )
     if initial_v <= 0:
         raise ValueError("initial_v must be positive")
+    if cfg_w < 0.0:
+        raise ValueError("cfg_w must be non-negative")
 
     if actions is None:
         actions = sample_action_schedule(
@@ -166,11 +169,11 @@ def autoregressive_rollout(
 
         vol_cond = torch.cat([log_v_t, a_onehot], dim=-1)
         z_vol = torch.randn(n_paths, 1, generator=rng, dtype=dtype).to(device)
-        log_v_next = vol_sampler.sample(vol_cond, noise=z_vol)  # [N, 1] normalized
+        log_v_next = vol_sampler.sample(vol_cond, noise=z_vol, cfg_w=cfg_w)  # [N, 1] normalized
 
         ret_cond = torch.cat([log_v_next, log_v_t, r_prev_t, a_onehot], dim=-1)
         z_ret = torch.randn(n_paths, 1, generator=rng, dtype=dtype).to(device)
-        r_next = ret_sampler.sample(ret_cond, noise=z_ret)       # [N, 1] normalized
+        r_next = ret_sampler.sample(ret_cond, noise=z_ret, cfg_w=cfg_w)       # [N, 1] normalized
 
         log_v_paths_norm[:, step + 1] = log_v_next.detach().cpu().numpy().reshape(-1)
         r_paths_norm[:, step] = r_next.detach().cpu().numpy().reshape(-1)

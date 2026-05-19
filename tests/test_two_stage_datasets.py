@@ -78,3 +78,33 @@ def test_vol_dataset_without_actions_uses_single_dim(tmp_path: Path) -> None:
     assert item["condition"].shape == (2,)
     assert int(item["action"]) == 0
     assert torch.isclose(item["condition"][1], torch.tensor(1.0))
+
+
+def test_action_dropout_zeroes_action_slice(tmp_path: Path) -> None:
+    metadata = generate_heston_dataset(
+        tmp_path, n_train=3, n_val=1, n_test=1, n_steps=4,
+        regimes=DEFAULT_REGIMES, transition_matrix=DEFAULT_TRANSITION_MATRIX,
+        initial_regime=0, seed=14, save_transitions=True,
+    )
+    num_actions = metadata["num_actions"]
+    vol_ds = HestonVolTransitionDataset(
+        tmp_path / "train_transitions.npz",
+        normalize=True,
+        log_v_mean=metadata["normalization"]["log_v_mean"],
+        log_v_std=metadata["normalization"]["log_v_std"],
+        num_actions=num_actions,
+        action_dropout_prob=1.0,
+    )
+    assert torch.allclose(vol_ds[0]["condition"][1:], torch.zeros(num_actions))
+
+    ret_ds = HestonRetTransitionDataset(
+        tmp_path / "train_transitions.npz",
+        normalize=True,
+        log_v_mean=metadata["normalization"]["log_v_mean"],
+        log_v_std=metadata["normalization"]["log_v_std"],
+        return_mean=metadata["normalization"]["return_mean"],
+        return_std=metadata["normalization"]["return_std"],
+        num_actions=num_actions,
+        action_dropout_prob=1.0,
+    )
+    assert torch.allclose(ret_ds[0]["condition"][3:], torch.zeros(num_actions))

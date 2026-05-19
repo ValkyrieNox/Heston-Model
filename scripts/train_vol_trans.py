@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
+    parser.add_argument("--action-dropout-prob", type=float, default=0.1,
+                        help="drop action one-hot during training for CFG support")
 
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--time-embedding-dim", type=int, default=64)
@@ -72,6 +74,7 @@ def main() -> None:
         log_every=args.log_every,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
+        action_dropout_prob=args.action_dropout_prob,
     )
     summary = train_vol_trans_fm(
         data_dir=args.data_dir,

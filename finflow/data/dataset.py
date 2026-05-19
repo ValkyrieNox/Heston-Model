@@ -88,6 +88,21 @@ def _one_hot(index: int, dim: int) -> torch.Tensor:
     return out
 
 
+def _validate_action_dropout_prob(prob: float) -> float:
+    prob = float(prob)
+    if not 0.0 <= prob <= 1.0:
+        raise ValueError("action_dropout_prob must be in [0, 1]")
+    return prob
+
+
+def _maybe_drop_action(action_onehot: torch.Tensor, prob: float) -> torch.Tensor:
+    if prob <= 0.0:
+        return action_onehot
+    if torch.rand(()) < prob:
+        return torch.zeros_like(action_onehot)
+    return action_onehot
+
+
 class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
     """V3 Stage 1a: variance transition kernel.
 
@@ -102,12 +117,14 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
         log_v_mean: float = 0.0,
         log_v_std: float = 1.0,
         num_actions: int = 1,
+        action_dropout_prob: float = 0.0,
     ) -> None:
         self.path = Path(path)
         self.normalize = normalize
         self.log_v_mean = float(log_v_mean)
         self.log_v_std = float(log_v_std)
         self.num_actions = int(num_actions)
+        self.action_dropout_prob = _validate_action_dropout_prob(action_dropout_prob)
         if self.log_v_std <= 0:
             raise ValueError("log_v_std must be positive")
         if self.num_actions <= 0:
@@ -143,7 +160,7 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
             log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
 
-        a_onehot = _one_hot(action, self.num_actions)
+        a_onehot = _maybe_drop_action(_one_hot(action, self.num_actions), self.action_dropout_prob)
         condition = torch.cat([torch.tensor([log_v_t], dtype=torch.float32), a_onehot])
         target = torch.tensor([log_v_next], dtype=torch.float32)
         return {
@@ -175,6 +192,7 @@ class HestonRetTransitionDataset(Dataset[dict[str, torch.Tensor]]):
         return_mean: float = 0.0,
         return_std: float = 1.0,
         num_actions: int = 1,
+        action_dropout_prob: float = 0.0,
     ) -> None:
         self.path = Path(path)
         self.normalize = normalize
@@ -183,6 +201,7 @@ class HestonRetTransitionDataset(Dataset[dict[str, torch.Tensor]]):
         self.return_mean = float(return_mean)
         self.return_std = float(return_std)
         self.num_actions = int(num_actions)
+        self.action_dropout_prob = _validate_action_dropout_prob(action_dropout_prob)
         if self.log_v_std <= 0 or self.return_std <= 0:
             raise ValueError("normalization std values must be positive")
         if self.num_actions <= 0:
@@ -224,7 +243,7 @@ class HestonRetTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             r_t = (r_t - self.return_mean) / self.return_std
             r_next = (r_next - self.return_mean) / self.return_std
 
-        a_onehot = _one_hot(action, self.num_actions)
+        a_onehot = _maybe_drop_action(_one_hot(action, self.num_actions), self.action_dropout_prob)
         condition = torch.cat(
             [torch.tensor([log_v_next, log_v_t, r_t], dtype=torch.float32), a_onehot]
         )

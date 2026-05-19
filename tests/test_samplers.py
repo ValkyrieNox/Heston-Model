@@ -66,3 +66,25 @@ def test_sampler_accepts_provided_noise():
     out_a = sampler.sample(cond, noise=z)
     out_b = sampler.sample(cond, noise=z)
     assert torch.allclose(out_a, out_b)
+
+
+def test_mean_flow_sampler_cfg_zeroes_action_slice_for_uncond_branch():
+    class ActionMeanFlow(torch.nn.Module):
+        state_dim = 1
+        condition_dim = 3
+
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, x, r, t, condition):
+            action_strength = condition[:, -2:].sum(dim=1, keepdim=True)
+            return action_strength + self.anchor
+
+    sampler = MeanFlowSampler(ActionMeanFlow(), num_actions=2)
+    cond = torch.tensor([[0.5, 1.0, 0.0]])
+    noise = torch.full((1, 1), 2.0)
+    unguided = sampler.sample(cond, noise=noise)
+    guided = sampler.sample(cond, noise=noise, cfg_w=2.0)
+    assert torch.allclose(unguided, torch.tensor([[1.0]]))
+    assert torch.allclose(guided, torch.tensor([[-1.0]]))
