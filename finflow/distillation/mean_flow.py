@@ -73,7 +73,10 @@ class MeanFlowDistillConfig:
     max_val_batches: int | None = None
     # MF-specific
     boundary_prob: float = 0.25
+    boundary_prob_start: float | None = None
+    boundary_prob_end: float | None = None
     identity_weight: float = 1.0
+    identity_residual_eval: bool = False
     warm_start: bool = True
     progress: bool = True
     progress_min_interval: float = 0.2
@@ -103,7 +106,36 @@ def _sample_r_t(
     return r, t
 
 
-def mean_flow_loss(
+def _sample_r_t_with_mask(
+    batch_size: int,
+    time_eps: float,
+    boundary_prob: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample ``(r, t)`` and return the exact ``r == t`` boundary mask."""
+
+    u = torch.rand(batch_size, 2, device=device, dtype=dtype)
+    r = u.min(dim=1).values
+    t = u.max(dim=1).values
+    r = r.clamp(min=time_eps, max=1.0 - time_eps)
+    t = t.clamp(min=time_eps, max=1.0 - time_eps)
+    t = torch.maximum(t, r)
+    if boundary_prob > 0.0:
+        boundary_mask = torch.rand(batch_size, device=device) < boundary_prob
+        r = torch.where(boundary_mask, t, r)
+    else:
+        boundary_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+    return r, t, boundary_mask
+
+
+def _mean_or_zero(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if bool(mask.any()):
+        return values[mask].mean()
+    return values.new_zeros(())
+
+
+def mean_flow_loss_components(
     student: MeanFlowStudent,
     teacher: TransitionFM,
     condition: torch.Tensor,
@@ -111,8 +143,11 @@ def mean_flow_loss(
     time_eps: float = 1e-3,
     boundary_prob: float = 0.25,
     identity_weight: float = 1.0,
-) -> torch.Tensor:
-    """Compute the Mean Flow distillation loss for a single batch."""
+) -> dict[str, torch.Tensor]:
+    """Compute total, boundary, and identity Mean Flow losses for one batch."""
+
+    if not 0.0 <= boundary_prob <= 1.0:
+        raise ValueError("boundary_prob must be in [0, 1]")
 
     if target.ndim != 2:
         raise ValueError("target must have shape [batch, state_dim]")
@@ -123,7 +158,8 @@ def mean_flow_loss(
     device = target.device
     dtype = target.dtype
 
-    r, t = _sample_r_t(batch_size, time_eps, boundary_prob, device, dtype)
+    r, t, boundary_mask = _sample_r_t_with_mask(batch_size, time_eps, boundary_prob, device, dtype)
+    identity_mask = ~boundary_mask
     noise = torch.randn_like(target)
 
     def fn(t_in: torch.Tensor) -> torch.Tensor:
@@ -143,7 +179,98 @@ def mean_flow_loss(
     delta = (t - r).reshape(batch_size, *([1] * (target.ndim - 1)))
     u_target = v_teacher - identity_weight * delta * du_dt.detach()
 
-    return F.mse_loss(pred_u, u_target)
+    per_item_loss = F.mse_loss(pred_u, u_target, reduction="none").reshape(batch_size, -1).mean(dim=1)
+    boundary_count = boundary_mask.sum()
+    identity_count = identity_mask.sum()
+    return {
+        "loss": per_item_loss.mean(),
+        "boundary_loss": _mean_or_zero(per_item_loss, boundary_mask),
+        "identity_loss": _mean_or_zero(per_item_loss, identity_mask),
+        "boundary_count": boundary_count.to(dtype=per_item_loss.dtype),
+        "identity_count": identity_count.to(dtype=per_item_loss.dtype),
+        "boundary_fraction": boundary_count.to(dtype=per_item_loss.dtype) / float(batch_size),
+    }
+
+
+def mean_flow_loss(
+    student: MeanFlowStudent,
+    teacher: TransitionFM,
+    condition: torch.Tensor,
+    target: torch.Tensor,
+    time_eps: float = 1e-3,
+    boundary_prob: float = 0.25,
+    identity_weight: float = 1.0,
+) -> torch.Tensor:
+    """Compute the scalar Mean Flow distillation loss for a single batch."""
+
+    return mean_flow_loss_components(
+        student, teacher, condition, target,
+        time_eps=time_eps, boundary_prob=boundary_prob,
+        identity_weight=identity_weight,
+    )["loss"]
+
+
+def _empty_mean_flow_stats() -> dict[str, float]:
+    return {
+        "loss_sum": 0.0,
+        "items": 0.0,
+        "boundary_loss_sum": 0.0,
+        "boundary_items": 0.0,
+        "identity_loss_sum": 0.0,
+        "identity_items": 0.0,
+    }
+
+
+def _accumulate_mean_flow_stats(
+    stats: dict[str, float],
+    components: dict[str, torch.Tensor],
+    batch_size: int,
+) -> None:
+    boundary_items = float(components["boundary_count"].item())
+    identity_items = float(components["identity_count"].item())
+    stats["loss_sum"] += float(components["loss"].item()) * batch_size
+    stats["items"] += float(batch_size)
+    stats["boundary_loss_sum"] += float(components["boundary_loss"].item()) * boundary_items
+    stats["boundary_items"] += boundary_items
+    stats["identity_loss_sum"] += float(components["identity_loss"].item()) * identity_items
+    stats["identity_items"] += identity_items
+
+
+def _finalize_mean_flow_stats(stats: dict[str, float]) -> dict[str, float]:
+    items = max(stats["items"], 1.0)
+    boundary_items = stats["boundary_items"]
+    identity_items = stats["identity_items"]
+    return {
+        "loss": stats["loss_sum"] / items,
+        "boundary_loss": (
+            stats["boundary_loss_sum"] / boundary_items if boundary_items > 0 else 0.0
+        ),
+        "identity_loss": (
+            stats["identity_loss_sum"] / identity_items if identity_items > 0 else 0.0
+        ),
+        "boundary_fraction": boundary_items / items,
+    }
+
+
+def _validate_probability(name: str, value: float) -> None:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+
+
+def _boundary_prob_for_epoch(config: MeanFlowDistillConfig, epoch: int) -> float:
+    if (config.boundary_prob_start is None) != (config.boundary_prob_end is None):
+        raise ValueError("boundary_prob_start and boundary_prob_end must be set together")
+    if config.boundary_prob_start is None:
+        return float(config.boundary_prob)
+
+    start = float(config.boundary_prob_start)
+    end = float(config.boundary_prob_end)
+    if config.epochs <= 1:
+        return start
+    if epoch >= config.epochs:
+        return end
+    fraction = (epoch - 1) / max(config.epochs - 1, 1)
+    return start + (end - start) * fraction
 
 
 def _evaluate_mean_flow(
@@ -159,11 +286,10 @@ def _evaluate_mean_flow(
     disable_progress: bool,
     progress_min_interval: float,
     desc: str,
-) -> float:
+) -> dict[str, float]:
     student.eval()
     teacher.eval()
-    total = 0.0
-    seen = 0
+    stats = _empty_mean_flow_stats()
     bar = _make_progress(
         _iterate_batches(loader, max_batches),
         total=_effective_num_batches(loader, max_batches),
@@ -180,18 +306,22 @@ def _evaluate_mean_flow(
             # jvp works under no_grad as long as we don't backward. To avoid
             # extra cost, evaluate with random (r, t) and a single noise.
             with torch.enable_grad():
-                loss = mean_flow_loss(
+                components = mean_flow_loss_components(
                     student, teacher, condition, target,
                     time_eps=time_eps, boundary_prob=boundary_prob,
                     identity_weight=identity_weight,
                 )
             bs = condition.shape[0]
-            total += float(loss.item()) * bs
-            seen += bs
+            _accumulate_mean_flow_stats(stats, components, bs)
             if not disable_progress:
-                bar.set_postfix(loss=f"{total / max(seen, 1):.4f}", refresh=False)
+                current = _finalize_mean_flow_stats(stats)
+                bar.set_postfix(
+                    loss=f"{current['loss']:.4f}",
+                    ident=f"{current['identity_loss']:.4f}",
+                    refresh=False,
+                )
     bar.close()
-    return total / max(seen, 1)
+    return _finalize_mean_flow_stats(stats)
 
 
 def _train_one_epoch_mean_flow(
@@ -209,11 +339,10 @@ def _train_one_epoch_mean_flow(
     disable_progress: bool,
     progress_min_interval: float,
     desc: str,
-) -> float:
+) -> dict[str, float]:
     student.train()
     teacher.eval()
-    total = 0.0
-    seen = 0
+    stats = _empty_mean_flow_stats()
     bar = _make_progress(
         _iterate_batches(loader, max_batches),
         total=_effective_num_batches(loader, max_batches),
@@ -223,22 +352,27 @@ def _train_one_epoch_mean_flow(
         condition = batch["condition"].to(device, non_blocking=True)
         target = batch["target"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        loss = mean_flow_loss(
+        components = mean_flow_loss_components(
             student, teacher, condition, target,
             time_eps=time_eps, boundary_prob=boundary_prob,
             identity_weight=identity_weight,
         )
+        loss = components["loss"]
         loss.backward()
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip_norm)
         optimizer.step()
         bs = condition.shape[0]
-        total += float(loss.item()) * bs
-        seen += bs
+        _accumulate_mean_flow_stats(stats, components, bs)
         if not disable_progress:
-            bar.set_postfix(loss=f"{total / max(seen, 1):.4f}", refresh=False)
+            current = _finalize_mean_flow_stats(stats)
+            bar.set_postfix(
+                loss=f"{current['loss']:.4f}",
+                ident=f"{current['identity_loss']:.4f}",
+                refresh=False,
+            )
     bar.close()
-    return total / max(seen, 1)
+    return _finalize_mean_flow_stats(stats)
 
 
 def train_mean_flow_distill(
@@ -253,6 +387,12 @@ def train_mean_flow_distill(
 
     if stage not in ("vol", "ret"):
         raise ValueError("stage must be 'vol' or 'ret'")
+    _validate_probability("boundary_prob", float(distill_config.boundary_prob))
+    if distill_config.boundary_prob_start is not None:
+        _validate_probability("boundary_prob_start", float(distill_config.boundary_prob_start))
+    if distill_config.boundary_prob_end is not None:
+        _validate_probability("boundary_prob_end", float(distill_config.boundary_prob_end))
+    _boundary_prob_for_epoch(distill_config, 1)
     set_seed(distill_config.seed)
 
     device = resolve_device(distill_config.device)
@@ -355,10 +495,11 @@ def train_mean_flow_distill(
         epoch_start = time.monotonic()
         desc_train = f"epoch {epoch:>3}/{distill_config.epochs} train"
         desc_val = f"epoch {epoch:>3}/{distill_config.epochs} val  "
-        train_loss = _train_one_epoch_mean_flow(
+        boundary_prob = _boundary_prob_for_epoch(distill_config, epoch)
+        train_stats = _train_one_epoch_mean_flow(
             student, teacher, train_loader, optimizer, device,
             time_eps=distill_config.time_eps,
-            boundary_prob=distill_config.boundary_prob,
+            boundary_prob=boundary_prob,
             identity_weight=distill_config.identity_weight,
             grad_clip_norm=distill_config.grad_clip_norm,
             max_batches=distill_config.max_train_batches,
@@ -366,26 +507,50 @@ def train_mean_flow_distill(
             progress_min_interval=distill_config.progress_min_interval,
             desc=desc_train,
         )
-        val_loss = _evaluate_mean_flow(
+        val_stats = _evaluate_mean_flow(
             student, teacher, val_loader, device,
             time_eps=distill_config.time_eps,
-            boundary_prob=distill_config.boundary_prob,
+            boundary_prob=boundary_prob,
             identity_weight=distill_config.identity_weight,
             max_batches=distill_config.max_val_batches,
             disable_progress=disable_progress,
             progress_min_interval=distill_config.progress_min_interval,
             desc=desc_val,
         )
+        identity_residual = None
+        if distill_config.identity_residual_eval:
+            identity_stats = _evaluate_mean_flow(
+                student, teacher, val_loader, device,
+                time_eps=distill_config.time_eps,
+                boundary_prob=0.0,
+                identity_weight=distill_config.identity_weight,
+                max_batches=distill_config.max_val_batches,
+                disable_progress=disable_progress,
+                progress_min_interval=distill_config.progress_min_interval,
+                desc=f"epoch {epoch:>3}/{distill_config.epochs} ident",
+            )
+            identity_residual = identity_stats["identity_loss"]
+        train_loss = train_stats["loss"]
+        val_loss = val_stats["loss"]
         epoch_time = time.monotonic() - epoch_start
         global_step += train_batches
 
         record = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_boundary_loss": train_stats["boundary_loss"],
+            "train_identity_loss": train_stats["identity_loss"],
+            "train_boundary_fraction": train_stats["boundary_fraction"],
             "val_loss": val_loss,
+            "val_boundary_loss": val_stats["boundary_loss"],
+            "val_identity_loss": val_stats["identity_loss"],
+            "val_boundary_fraction": val_stats["boundary_fraction"],
+            "boundary_prob": boundary_prob,
             "global_step": global_step,
             "epoch_time_s": epoch_time,
         }
+        if identity_residual is not None:
+            record["val_identity_residual"] = identity_residual
         history.append(record)
         with metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
@@ -399,6 +564,11 @@ def train_mean_flow_distill(
             normalization=normalization, stage=f"mf_{stage}", num_actions=num_actions,
             extra={
                 "train_loss": train_loss, "val_loss": val_loss,
+                "train_boundary_loss": train_stats["boundary_loss"],
+                "train_identity_loss": train_stats["identity_loss"],
+                "val_boundary_loss": val_stats["boundary_loss"],
+                "val_identity_loss": val_stats["identity_loss"],
+                "boundary_prob": boundary_prob,
                 "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
                 "warm_started_params": warm_copied,
                 "kind": "mean_flow",
@@ -414,6 +584,11 @@ def train_mean_flow_distill(
                 normalization=normalization, stage=f"mf_{stage}", num_actions=num_actions,
                 extra={
                     "train_loss": train_loss, "val_loss": val_loss,
+                    "train_boundary_loss": train_stats["boundary_loss"],
+                    "train_identity_loss": train_stats["identity_loss"],
+                    "val_boundary_loss": val_stats["boundary_loss"],
+                    "val_identity_loss": val_stats["identity_loss"],
+                    "boundary_prob": boundary_prob,
                     "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
                     "warm_started_params": warm_copied,
                     "kind": "mean_flow",
@@ -426,6 +601,7 @@ def train_mean_flow_distill(
             print(
                 f"  epoch {epoch:>3}/{distill_config.epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
+                f"ident={val_stats['identity_loss']:.4f} | boundary_p={boundary_prob:.3f} | "
                 f"best={best_val:.4f}{' *' if is_best else '  '} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}",

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import torch
 
@@ -7,7 +8,12 @@ from finflow.data import (
     DEFAULT_TRANSITION_MATRIX,
     generate_heston_dataset,
 )
-from finflow.distillation import MeanFlowDistillConfig, mean_flow_loss, train_mean_flow_distill
+from finflow.distillation import (
+    MeanFlowDistillConfig,
+    mean_flow_loss,
+    mean_flow_loss_components,
+    train_mean_flow_distill,
+)
 from finflow.models import MeanFlowStudent, TransitionFM
 from finflow.training import (
     TransitionFMTrainConfig,
@@ -60,6 +66,27 @@ def test_mean_flow_loss_uses_reversed_teacher_velocity_at_boundary():
     assert loss.item() < 1e-8
 
 
+def test_mean_flow_loss_components_split_boundary_and_identity():
+    torch.manual_seed(0)
+    teacher = TransitionFM(state_dim=1, condition_dim=4, hidden_dim=16, time_embedding_dim=8, num_blocks=2)
+    student = MeanFlowStudent(state_dim=1, condition_dim=4, hidden_dim=16, time_embedding_dim=8, num_blocks=2)
+    cond = torch.randn(8, 4)
+    target = torch.randn(8, 1)
+
+    boundary = mean_flow_loss_components(
+        student, teacher, cond, target, time_eps=1e-3, boundary_prob=1.0,
+    )
+    assert torch.isclose(boundary["boundary_fraction"], torch.tensor(1.0))
+    assert boundary["identity_count"].item() == 0.0
+    assert torch.isclose(boundary["loss"], boundary["boundary_loss"])
+
+    identity = mean_flow_loss_components(
+        student, teacher, cond, target, time_eps=1e-3, boundary_prob=0.0,
+    )
+    assert identity["boundary_count"].item() == 0.0
+    assert torch.isclose(identity["loss"], identity["identity_loss"])
+
+
 def _generate_smoke_data(tmp_path: Path):
     data_dir = tmp_path / "data"
     metadata = generate_heston_dataset(
@@ -93,9 +120,10 @@ def test_train_mean_flow_distill_smoke(tmp_path: Path):
         run_name="mf_smoke",
         distill_config=MeanFlowDistillConfig(
             teacher_checkpoint=teacher_summary["checkpoints"]["best"],
-            batch_size=4, epochs=1, lr=1e-3, weight_decay=0.0,
+            batch_size=4, epochs=2, lr=1e-3, weight_decay=0.0,
             seed=8, device="cpu", max_train_batches=2, max_val_batches=1,
-            boundary_prob=0.5, progress=False,
+            boundary_prob_start=0.5, boundary_prob_end=0.1,
+            identity_residual_eval=True, progress=False,
         ),
         student_config=TwoStageFMModelConfig(
             state_dim=1, condition_dim=1 + num_actions,
@@ -105,3 +133,13 @@ def test_train_mean_flow_distill_smoke(tmp_path: Path):
     assert Path(distill_summary["checkpoints"]["best"]).exists()
     assert distill_summary["stage"] == "mf_vol"
     assert distill_summary["num_actions"] == num_actions
+    history = distill_summary["history"]
+    assert history[0]["boundary_prob"] == 0.5
+    assert history[-1]["boundary_prob"] == 0.1
+    assert "train_boundary_loss" in history[-1]
+    assert "train_identity_loss" in history[-1]
+    assert "val_identity_residual" in history[-1]
+
+    metrics_path = Path(distill_summary["run_dir"]) / "metrics.jsonl"
+    records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["boundary_prob"] == 0.1

@@ -39,8 +39,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-batches", type=int, default=None)
 
     parser.add_argument("--boundary-prob", type=float, default=0.25,
-                        help="fraction of batch where r=t (FM regression anchor)")
+                        help="fixed fraction of batch where r=t when no curriculum is set")
+    parser.add_argument("--boundary-prob-start", type=float, default=0.5,
+                        help="first-epoch r=t anchor fraction for P1 curriculum")
+    parser.add_argument("--boundary-prob-end", type=float, default=0.1,
+                        help="last-epoch r=t anchor fraction for P1 curriculum")
+    parser.add_argument("--no-boundary-curriculum", action="store_true",
+                        help="use --boundary-prob as a fixed anchor fraction")
     parser.add_argument("--identity-weight", type=float, default=1.0)
+    parser.add_argument("--identity-residual-eval", action="store_true",
+                        help="also evaluate a pure identity-residual validation loss each epoch")
     parser.add_argument("--no-warm-start", action="store_true",
                         help="train MF student from random init (no teacher copy)")
 
@@ -83,7 +91,10 @@ def main() -> None:
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
         boundary_prob=args.boundary_prob,
+        boundary_prob_start=None if args.no_boundary_curriculum else args.boundary_prob_start,
+        boundary_prob_end=None if args.no_boundary_curriculum else args.boundary_prob_end,
         identity_weight=args.identity_weight,
+        identity_residual_eval=args.identity_residual_eval,
         warm_start=not args.no_warm_start,
     )
 

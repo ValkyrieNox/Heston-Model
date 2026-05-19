@@ -8,6 +8,7 @@ from finflow.distillation.consistency import (
 from finflow.distillation.mean_flow import (
     MeanFlowDistillConfig,
     mean_flow_loss,
+    mean_flow_loss_components,
     train_mean_flow_distill,
 )
 
@@ -16,6 +17,7 @@ __all__ = [
     "MeanFlowDistillConfig",
     "consistency_distill_step",
     "mean_flow_loss",
+    "mean_flow_loss_components",
     "train_consistency_distill",
     "train_mean_flow_distill",
 ]
