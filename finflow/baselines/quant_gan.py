@@ -1,9 +1,7 @@
-"""Minimal Quant GAN baseline (Wiese et al. 2020).
+"""Quant GAN baseline (Wiese et al. 2020).
 
 A small Temporal Convolutional Network (TCN) generator and discriminator
-trained with LSGAN loss on Heston log-return sequences. Kept intentionally
-simple so it serves as a comparison point against the V3 FM / MF pipeline,
-not a SOTA replication.
+trained with WGAN-GP on Lambert-W Gaussianized Heston log-return sequences.
 """
 
 from __future__ import annotations
@@ -38,8 +36,82 @@ from finflow.training import (
 # ---------------------------------------------------------------------------
 
 
+def _lambertw_principal_nonnegative(z: np.ndarray, *, max_iter: int = 20) -> np.ndarray:
+    """Principal Lambert W branch for non-negative real inputs."""
+
+    z = np.asarray(z, dtype=np.float64)
+    if np.any(z < 0):
+        raise ValueError("Lambert W fallback expects non-negative inputs")
+    w = np.where(z < 1.0, z / (1.0 + z), np.log1p(z))
+    w = np.maximum(w, 0.0)
+    for _ in range(max_iter):
+        ew = np.exp(w)
+        f = w * ew - z
+        denom = ew * (w + 1.0) - ((w + 2.0) * f) / np.maximum(2.0 * w + 2.0, 1e-12)
+        step = f / np.maximum(denom, 1e-12)
+        w_next = np.maximum(w - step, 0.0)
+        if np.max(np.abs(w_next - w)) < 1e-12:
+            return w_next
+        w = w_next
+    return w
+
+
+def lambert_w_transform(values: np.ndarray, delta: float = 0.1) -> np.ndarray:
+    """Gaussianize heavy-tailed standardized returns with the Lambert-W inverse.
+
+    The input is expected to already be centered and scaled. ``delta=0`` keeps
+    the legacy identity transform.
+    """
+
+    x = np.asarray(values, dtype=np.float64)
+    if delta < 0:
+        raise ValueError("delta must be non-negative")
+    if delta == 0:
+        return x.astype(np.float32, copy=False)
+    z = delta * np.square(x)
+    w = _lambertw_principal_nonnegative(z)
+    y = np.sign(x) * np.sqrt(np.maximum(w, 0.0) / delta)
+    return y.astype(np.float32, copy=False)
+
+
+def inverse_lambert_w_transform(values: np.ndarray, delta: float = 0.1) -> np.ndarray:
+    """Map Lambert-W Gaussianized returns back to the standardized return domain."""
+
+    y = np.asarray(values, dtype=np.float64)
+    if delta < 0:
+        raise ValueError("delta must be non-negative")
+    if delta == 0:
+        return y.astype(np.float32, copy=False)
+    exponent = np.clip(0.5 * delta * np.square(y), 0.0, 20.0)
+    x = y * np.exp(exponent)
+    return x.astype(np.float32, copy=False)
+
+
+def calibrate_standardized_moments(
+    values: np.ndarray,
+    *,
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Affine-calibrate generated standardized returns to zero mean / unit std."""
+
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+    x = np.asarray(values, dtype=np.float64)
+    before_mean = float(x.mean())
+    before_std = float(x.std(ddof=0))
+    scale = max(before_std, eps)
+    y = (x - before_mean) / scale
+    info = {
+        "before_mean": before_mean,
+        "before_std": before_std,
+        "after_mean": float(y.mean()),
+        "after_std": float(y.std(ddof=0)),
+    }
+    return y.astype(np.float32, copy=False), info
+
+
 class HestonLogReturnSequenceDataset(Dataset[torch.Tensor]):
-    """Yield normalized log-return sequences ``[n_steps]`` from a split ``.npz``."""
+    """Yield transformed log-return sequences ``[n_steps]`` from a split ``.npz``."""
 
     def __init__(
         self,
@@ -47,10 +119,13 @@ class HestonLogReturnSequenceDataset(Dataset[torch.Tensor]):
         *,
         return_mean: float = 0.0,
         return_std: float = 1.0,
+        lambert_w_delta: float = 0.1,
     ) -> None:
         self.npz_path = Path(npz_path)
         if return_std <= 0:
             raise ValueError("return_std must be positive")
+        if lambert_w_delta < 0:
+            raise ValueError("lambert_w_delta must be non-negative")
         npz = np.load(self.npz_path)
         if "log_returns" not in npz.files:
             raise ValueError(f"{self.npz_path} missing 'log_returns'")
@@ -58,14 +133,18 @@ class HestonLogReturnSequenceDataset(Dataset[torch.Tensor]):
         npz.close()
         self.return_mean = float(return_mean)
         self.return_std = float(return_std)
+        self.lambert_w_delta = float(lambert_w_delta)
+        returns_norm = (self.returns - self.return_mean) / self.return_std
+        self.transformed_returns = lambert_w_transform(
+            returns_norm, delta=self.lambert_w_delta,
+        )
 
     def __len__(self) -> int:
         return int(self.returns.shape[0])
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        r = self.returns[index]
-        r_norm = (r - self.return_mean) / self.return_std
-        return torch.from_numpy(np.ascontiguousarray(r_norm)).float()
+        r_trans = self.transformed_returns[index]
+        return torch.from_numpy(np.ascontiguousarray(r_trans)).float()
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +191,16 @@ class QuantGANGenerator(nn.Module):
             ]
         )
         self.output = nn.Conv1d(hidden_channels, 1, kernel_size=1)
+        self.output_norm = nn.LayerNorm(seq_len)
+        self.output_scale = nn.Parameter(torch.ones(1, 1, 1))
+        self.output_shift = nn.Parameter(torch.zeros(1, 1, 1))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         h = self.input_proj(z)
         for block in self.blocks:
             h = block(h)
-        return self.output(h)
+        raw = self.output_norm(self.output(h))
+        return self.output_scale * torch.tanh(raw) + self.output_shift
 
 
 class QuantGANDiscriminator(nn.Module):
@@ -165,11 +248,16 @@ class QuantGANConfig:
 @dataclass(frozen=True)
 class QuantGANTrainConfig:
     batch_size: int = 128
-    epochs: int = 20
+    epochs: int = 30
     lr_g: float = 2e-4
     lr_d: float = 2e-4
-    betas: tuple[float, float] = (0.5, 0.999)
-    d_steps_per_g: int = 1
+    betas: tuple[float, float] = (0.0, 0.9)
+    d_steps_per_g: int = 5
+    gradient_penalty_weight: float = 10.0
+    lambert_w_delta: float = 0.1
+    moment_penalty_weight: float = 1.0
+    moment_mean_weight: float = 1.0
+    moment_std_weight: float = 1.0
     grad_clip_norm: float = 1.0
     num_workers: int = 0
     seed: int = 1234
@@ -184,8 +272,46 @@ class QuantGANTrainConfig:
 # ---------------------------------------------------------------------------
 
 
-def _ls_loss(value: torch.Tensor, target: float) -> torch.Tensor:
-    return 0.5 * ((value - target) ** 2).mean()
+def _gradient_penalty(
+    discriminator: QuantGANDiscriminator,
+    real: torch.Tensor,
+    fake: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = real.shape[0]
+    alpha = torch.rand(batch_size, 1, 1, device=real.device, dtype=real.dtype)
+    interpolated = (alpha * real + (1.0 - alpha) * fake).requires_grad_(True)
+    scores = discriminator(interpolated)
+    grad = torch.autograd.grad(
+        outputs=scores.sum(),
+        inputs=interpolated,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grad = grad.reshape(batch_size, -1)
+    return ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
+
+
+def _moment_penalty(
+    fake: torch.Tensor,
+    real: torch.Tensor,
+    *,
+    mean_weight: float = 1.0,
+    std_weight: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Match global first/second moments in the transformed training domain."""
+
+    if mean_weight < 0 or std_weight < 0:
+        raise ValueError("moment penalty weights must be non-negative")
+    fake_mean = fake.mean()
+    real_mean = real.mean()
+    fake_std = fake.std(unbiased=False).clamp_min(eps)
+    real_std = real.std(unbiased=False).clamp_min(eps)
+    return (
+        mean_weight * (fake_mean - real_mean).square()
+        + std_weight * (fake_std - real_std).square()
+    )
 
 
 def train_quant_gan(
@@ -200,6 +326,16 @@ def train_quant_gan(
 
     model_config = model_config or QuantGANConfig()
     train_config = train_config or QuantGANTrainConfig()
+    if train_config.d_steps_per_g <= 0:
+        raise ValueError("d_steps_per_g must be positive")
+    if train_config.gradient_penalty_weight < 0:
+        raise ValueError("gradient_penalty_weight must be non-negative")
+    if train_config.lambert_w_delta < 0:
+        raise ValueError("lambert_w_delta must be non-negative")
+    if train_config.moment_penalty_weight < 0:
+        raise ValueError("moment_penalty_weight must be non-negative")
+    if train_config.moment_mean_weight < 0 or train_config.moment_std_weight < 0:
+        raise ValueError("moment mean/std weights must be non-negative")
     set_seed(train_config.seed)
 
     device = resolve_device(train_config.device)
@@ -216,11 +352,13 @@ def train_quant_gan(
         data_dir / "train.npz",
         return_mean=normalization["return_mean"],
         return_std=normalization["return_std"],
+        lambert_w_delta=train_config.lambert_w_delta,
     )
     val_dataset = HestonLogReturnSequenceDataset(
         data_dir / "val.npz",
         return_mean=normalization["return_mean"],
         return_std=normalization["return_std"],
+        lambert_w_delta=train_config.lambert_w_delta,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=train_config.batch_size, shuffle=True,
@@ -268,6 +406,9 @@ def train_quant_gan(
         header = (
             f"[finflow] quant_gan | run={run_dir.name} | device={device} | "
             f"params_G={n_params_g/1e3:.1f}k params_D={n_params_d/1e3:.1f}k | "
+            f"wgan_gp={train_config.gradient_penalty_weight:g} "
+            f"moment={train_config.moment_penalty_weight:g} "
+            f"lambert_delta={train_config.lambert_w_delta:g} | "
             f"train={len(train_dataset)} samples ({train_batches} batch x {train_config.batch_size}) | "
             f"epochs={train_config.epochs}"
         )
@@ -287,7 +428,8 @@ def train_quant_gan(
             disable=disable_progress,
             min_interval=train_config.progress_min_interval,
         )
-        running_g, running_d, running_n = 0.0, 0.0, 0
+        running_g, running_g_adv, running_d = 0.0, 0.0, 0.0
+        running_gp, running_w, running_moment, running_n = 0.0, 0.0, 0.0, 0
         generator.train(); discriminator.train()
         for batch in bar:
             real = batch.to(device).unsqueeze(1)  # [B, 1, L]
@@ -300,7 +442,9 @@ def train_quant_gan(
                     fake = generator(z)
                 d_real = discriminator(real)
                 d_fake = discriminator(fake)
-                loss_d = _ls_loss(d_real, 1.0) + _ls_loss(d_fake, 0.0)
+                gp = _gradient_penalty(discriminator, real, fake)
+                wasserstein_est = d_real.mean() - d_fake.mean()
+                loss_d = d_fake.mean() - d_real.mean() + train_config.gradient_penalty_weight * gp
                 opt_d.zero_grad(set_to_none=True)
                 loss_d.backward()
                 if train_config.grad_clip_norm > 0:
@@ -311,7 +455,17 @@ def train_quant_gan(
             z = torch.randn(B, model_config.latent_dim, model_config.seq_len, device=device)
             fake = generator(z)
             d_fake = discriminator(fake)
-            loss_g = _ls_loss(d_fake, 1.0)
+            loss_g_adv = -d_fake.mean()
+            if train_config.moment_penalty_weight > 0:
+                moment_loss = _moment_penalty(
+                    fake,
+                    real,
+                    mean_weight=train_config.moment_mean_weight,
+                    std_weight=train_config.moment_std_weight,
+                )
+            else:
+                moment_loss = fake.new_tensor(0.0)
+            loss_g = loss_g_adv + train_config.moment_penalty_weight * moment_loss
             opt_g.zero_grad(set_to_none=True)
             loss_g.backward()
             if train_config.grad_clip_norm > 0:
@@ -319,19 +473,29 @@ def train_quant_gan(
             opt_g.step()
 
             running_g += float(loss_g.item()) * B
+            running_g_adv += float(loss_g_adv.item()) * B
             running_d += float(loss_d.item()) * B
+            running_gp += float(gp.item()) * B
+            running_w += float(wasserstein_est.item()) * B
+            running_moment += float(moment_loss.item()) * B
             running_n += B
             if not disable_progress:
                 bar.set_postfix(
                     g=f"{running_g / max(running_n, 1):.4f}",
                     d=f"{running_d / max(running_n, 1):.4f}",
+                    gp=f"{running_gp / max(running_n, 1):.3f}",
+                    mom=f"{running_moment / max(running_n, 1):.3f}",
                     refresh=False,
                 )
         bar.close()
         train_g = running_g / max(running_n, 1)
+        train_g_adv = running_g_adv / max(running_n, 1)
         train_d = running_d / max(running_n, 1)
+        train_gp = running_gp / max(running_n, 1)
+        train_w = running_w / max(running_n, 1)
+        train_moment = running_moment / max(running_n, 1)
 
-        # Validation: discriminator loss on real validation batch + fake.
+        # Validation: critic gap on real validation batch + fake.
         generator.eval(); discriminator.eval()
         v_running, v_n = 0.0, 0
         with torch.no_grad():
@@ -342,8 +506,8 @@ def train_quant_gan(
                 fake = generator(z)
                 d_real = discriminator(real)
                 d_fake = discriminator(fake)
-                loss = _ls_loss(d_real, 1.0) + _ls_loss(d_fake, 0.0)
-                v_running += float(loss.item()) * B
+                critic_loss = d_fake.mean() - d_real.mean()
+                v_running += float(critic_loss.item()) * B
                 v_n += B
         val_d = v_running / max(v_n, 1)
         epoch_time = time.monotonic() - epoch_start
@@ -352,7 +516,11 @@ def train_quant_gan(
         record = {
             "epoch": epoch,
             "train_g_loss": train_g,
+            "train_g_adv_loss": train_g_adv,
             "train_d_loss": train_d,
+            "train_gradient_penalty": train_gp,
+            "train_wasserstein_estimate": train_w,
+            "train_moment_loss": train_moment,
             "val_d_loss": val_d,
             "epoch_time_s": epoch_time,
             "global_step": global_step,
@@ -383,7 +551,9 @@ def train_quant_gan(
             eta_s = (elapsed / epoch) * (train_config.epochs - epoch)
             print(
                 f"  epoch {epoch:>3}/{train_config.epochs} | "
-                f"G={train_g:.4f} D={train_d:.4f} | val_D={val_d:.4f}{' *' if is_best else '  '} | "
+                f"G={train_g:.4f} Gadv={train_g_adv:.4f} D={train_d:.4f} "
+                f"GP={train_gp:.4f} W={train_w:.4f} Mom={train_moment:.4f} | "
+                f"val_D={val_d:.4f}{' *' if is_best else '  '} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}",
                 file=sys.stderr, flush=True,
@@ -417,6 +587,9 @@ def sample_quant_gan_paths(
     s0: float = 100.0,
     return_mean: float = 0.0,
     return_std: float = 1.0,
+    lambert_w_delta: float = 0.1,
+    calibrate_moments: bool = True,
+    calibration_eps: float = 1e-6,
     device: str | torch.device = "cpu",
     seed: int | None = None,
 ) -> dict[str, np.ndarray]:
@@ -431,13 +604,33 @@ def sample_quant_gan_paths(
         n_paths, generator.latent_dim, generator.seq_len,
         generator=rng,
     ).to(device)
-    fake_norm = generator(z).squeeze(1)  # [B, L]
-    fake = fake_norm.cpu().numpy() * return_std + return_mean
+    fake_trans = generator(z).squeeze(1).cpu().numpy()  # [B, L]
+    fake_norm = inverse_lambert_w_transform(fake_trans, delta=lambert_w_delta)
+    calibration: dict[str, float | bool]
+    if calibrate_moments:
+        fake_norm, calibration_info = calibrate_standardized_moments(
+            fake_norm,
+            eps=calibration_eps,
+        )
+        calibration = {"enabled": True, **calibration_info}
+    else:
+        calibration = {
+            "enabled": False,
+            "before_mean": float(fake_norm.mean()),
+            "before_std": float(fake_norm.std(ddof=0)),
+            "after_mean": float(fake_norm.mean()),
+            "after_std": float(fake_norm.std(ddof=0)),
+        }
+    fake = fake_norm * return_std + return_mean
     s = np.empty((n_paths, generator.seq_len + 1), dtype=np.float32)
     s[:, 0] = s0
     log_s = np.log(s0) + np.cumsum(fake, axis=1)
     s[:, 1:] = np.exp(log_s).astype(np.float32)
-    return {"log_returns": fake.astype(np.float32), "s_paths": s}
+    return {
+        "log_returns": fake.astype(np.float32),
+        "s_paths": s,
+        "calibration": calibration,
+    }
 
 
 def load_quant_gan_generator(
@@ -453,6 +646,6 @@ def load_quant_gan_generator(
         kernel_size=int(cfg["kernel_size"]),
         seq_len=int(cfg["seq_len"]),
     )
-    generator.load_state_dict(ckpt["generator_state"])
+    generator.load_state_dict(ckpt["generator_state"], strict=False)
     generator.to(map_location).eval()
     return generator, ckpt

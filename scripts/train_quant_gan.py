@@ -28,10 +28,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel-size", type=int, default=3)
 
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr-g", type=float, default=2e-4)
     parser.add_argument("--lr-d", type=float, default=2e-4)
-    parser.add_argument("--d-steps-per-g", type=int, default=1)
+    parser.add_argument("--d-steps-per-g", type=int, default=5)
+    parser.add_argument("--gradient-penalty-weight", type=float, default=10.0)
+    parser.add_argument("--lambert-w-delta", type=float, default=0.1)
+    parser.add_argument("--moment-penalty-weight", type=float, default=1.0)
+    parser.add_argument("--moment-mean-weight", type=float, default=1.0)
+    parser.add_argument("--moment-std-weight", type=float, default=1.0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
@@ -55,6 +60,11 @@ def main() -> None:
         lr_g=args.lr_g,
         lr_d=args.lr_d,
         d_steps_per_g=args.d_steps_per_g,
+        gradient_penalty_weight=args.gradient_penalty_weight,
+        lambert_w_delta=args.lambert_w_delta,
+        moment_penalty_weight=args.moment_penalty_weight,
+        moment_mean_weight=args.moment_mean_weight,
+        moment_std_weight=args.moment_std_weight,
         grad_clip_norm=args.grad_clip_norm,
         num_workers=args.num_workers,
         seed=args.seed,
