@@ -26,6 +26,8 @@ Options:
   --tag NAME                  default: EXPERIMENT_NAME
   --device DEVICE             default: auto
   --qgan-sample-device DEVICE default: cpu
+  --qgan-primary-checkpoint best|last
+                              default: last
   --n-rollout INT             default: 10000
   --n-oracle INT              default: 100000
   --steps INT                 default: 252
@@ -70,6 +72,7 @@ DATA_DIR=""
 TAG=""
 DEVICE="auto"
 QGAN_SAMPLE_DEVICE="cpu"
+QGAN_PRIMARY_CHECKPOINT="last"
 N_ROLLOUT="10000"
 N_ORACLE="100000"
 STEPS="252"
@@ -94,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     --tag) TAG="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --qgan-sample-device) QGAN_SAMPLE_DEVICE="$2"; shift 2 ;;
+    --qgan-primary-checkpoint) QGAN_PRIMARY_CHECKPOINT="$2"; shift 2 ;;
     --n-rollout) N_ROLLOUT="$2"; shift 2 ;;
     --n-oracle) N_ORACLE="$2"; shift 2 ;;
     --steps) STEPS="$2"; shift 2 ;;
@@ -130,7 +134,17 @@ MF_RET="$TRAIN_DIR/mf_ret/mf_ret_${TAG}/checkpoints/best.pt"
 CD_VOL="$TRAIN_DIR/cd_vol/cd_vol_${TAG}/checkpoints/best.pt"
 CD_RET="$TRAIN_DIR/cd_ret/cd_ret_${TAG}/checkpoints/best.pt"
 QGAN="$TRAIN_DIR/quant_gan/quant_gan_${TAG}/checkpoints/best.pt"
+QGAN_BEST="$TRAIN_DIR/quant_gan/quant_gan_${TAG}/checkpoints/best.pt"
+QGAN_LAST="$TRAIN_DIR/quant_gan/quant_gan_${TAG}/checkpoints/last.pt"
 ORACLE="$ORACLE_DIR/mc_oracle.npz"
+
+case "$QGAN_PRIMARY_CHECKPOINT" in
+  best|last) ;;
+  *)
+    echo "--qgan-primary-checkpoint must be 'best' or 'last'" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "$RUN_DIR" "$ROLLOUT_DIR" "$ORACLE_DIR" "$EVAL_DIR" "$META_DIR" "$LOG_DIR"
 TEST_STARTED_AT="$(timestamp_utc)"
@@ -163,6 +177,9 @@ config = {
     "tag": "$TAG",
     "device": "$DEVICE",
     "qgan_sample_device": "$QGAN_SAMPLE_DEVICE",
+    "qgan_primary_checkpoint": "$QGAN_PRIMARY_CHECKPOINT",
+    "qgan_checkpoint_variants": ["best", "last"],
+    "qgan_calibration_variants": ["raw", "calibrated"],
     "n_rollout": int("$N_ROLLOUT"),
     "n_oracle": int("$N_ORACLE"),
     "steps": int("$STEPS"),
@@ -218,6 +235,58 @@ run_if_missing() {
     echo "[skip] $step -> $marker"
     return 0
   fi
+
+  started_at="$(timestamp_utc)"
+  start_s="$(date +%s)"
+  echo "[run] $step"
+  {
+    echo "step=$step"
+    echo "started_at_utc=$started_at"
+    echo "marker=$marker"
+    printf "command="
+    quote_cmd "$@"
+    printf "\n\n"
+  } > "$log_path"
+
+  set +e
+  "$@" 2>&1 | tee -a "$log_path"
+  local rc=${PIPESTATUS[0]}
+  set -e
+
+  finished_at="$(timestamp_utc)"
+  end_s="$(date +%s)"
+  duration="$((end_s - start_s))"
+  if [[ "$rc" -eq 0 ]]; then
+    record_step "$step" "done" "$started_at" "$finished_at" "$duration" "$marker" "$@"
+    {
+      echo
+      echo "finished_at_utc=$finished_at"
+      echo "duration_s=$duration"
+      echo "status=done"
+    } >> "$log_path"
+  else
+    record_step "$step" "failed:$rc" "$started_at" "$finished_at" "$duration" "$marker" "$@"
+    {
+      echo
+      echo "finished_at_utc=$finished_at"
+      echo "duration_s=$duration"
+      echo "status=failed"
+      echo "exit_code=$rc"
+    } >> "$log_path"
+    exit "$rc"
+  fi
+}
+
+run_always() {
+  local step="$1"
+  local marker="$2"
+  shift 2
+  local started_at
+  local finished_at
+  local start_s
+  local end_s
+  local duration
+  local log_path="$LOG_DIR/${step}.log"
 
   started_at="$(timestamp_utc)"
   start_s="$(date +%s)"
@@ -321,7 +390,8 @@ require_file "$MF_VOL"
 require_file "$MF_RET"
 require_file "$CD_VOL"
 require_file "$CD_RET"
-require_file "$QGAN"
+require_file "$QGAN_BEST"
+require_file "$QGAN_LAST"
 
 read -r -a MONEYNESS_ARGS <<< "$MONEYNESS"
 read -r -a MATURITY_ARGS <<< "$MATURITIES"
@@ -378,13 +448,50 @@ run_if_missing rollout_cd "$ROLLOUT_DIR/rollout_cd.npz" \
     --cfg-w "$CD_CFG_W" \
     --device "$DEVICE"
 
-run_if_missing sample_quant_gan "$ROLLOUT_DIR/quant_gan_paths.npz" \
-  python3 scripts/sample_quant_gan.py \
-    --checkpoint "$QGAN" \
-    --output "$ROLLOUT_DIR/quant_gan_paths.npz" \
-    --n-paths "$N_ROLLOUT" \
-    --device "$QGAN_SAMPLE_DEVICE" \
-    --seed "$QGAN_SEED"
+sample_quant_gan_variant() {
+  local checkpoint_kind="$1"
+  local calibration_kind="$2"
+  local checkpoint=""
+  local output="$ROLLOUT_DIR/quant_gan_paths_${checkpoint_kind}_${calibration_kind}.npz"
+  local step="sample_quant_gan_${checkpoint_kind}_${calibration_kind}"
+  case "$checkpoint_kind" in
+    best) checkpoint="$QGAN_BEST" ;;
+    last) checkpoint="$QGAN_LAST" ;;
+    *) echo "unknown QGAN checkpoint kind: $checkpoint_kind" >&2; exit 2 ;;
+  esac
+  case "$calibration_kind" in
+    calibrated)
+      run_if_missing "$step" "$output" \
+        python3 scripts/sample_quant_gan.py \
+          --checkpoint "$checkpoint" \
+          --output "$output" \
+          --n-paths "$N_ROLLOUT" \
+          --device "$QGAN_SAMPLE_DEVICE" \
+          --seed "$QGAN_SEED"
+      ;;
+    raw)
+      run_if_missing "$step" "$output" \
+        python3 scripts/sample_quant_gan.py \
+          --checkpoint "$checkpoint" \
+          --output "$output" \
+          --n-paths "$N_ROLLOUT" \
+          --device "$QGAN_SAMPLE_DEVICE" \
+          --seed "$QGAN_SEED" \
+          --no-calibrate-moments
+      ;;
+    *) echo "unknown QGAN calibration kind: $calibration_kind" >&2; exit 2 ;;
+  esac
+}
+
+for qgan_checkpoint_kind in best last; do
+  for qgan_calibration_kind in raw calibrated; do
+    sample_quant_gan_variant "$qgan_checkpoint_kind" "$qgan_calibration_kind"
+  done
+done
+
+copy_if_missing sample_quant_gan_primary \
+  "$ROLLOUT_DIR/quant_gan_paths_${QGAN_PRIMARY_CHECKPOINT}_calibrated.npz" \
+  "$ROLLOUT_DIR/quant_gan_paths.npz"
 
 evaluate_if_missing eval_fm "$ROLLOUT_DIR/rollout_fm.npz" "$EVAL_DIR/eval_fm.json"
 evaluate_if_missing eval_mf "$ROLLOUT_DIR/rollout_mf.npz" "$EVAL_DIR/eval_mf.json"
@@ -393,7 +500,16 @@ for cfg_w in $CFG_WEIGHTS; do
     "$ROLLOUT_DIR/rollout_mf_cfg${cfg_w}.npz" "$EVAL_DIR/eval_mf_cfg${cfg_w}.json"
 done
 evaluate_if_missing eval_cd "$ROLLOUT_DIR/rollout_cd.npz" "$EVAL_DIR/eval_cd.json"
-evaluate_if_missing eval_quant_gan "$ROLLOUT_DIR/quant_gan_paths.npz" "$EVAL_DIR/eval_quant_gan.json"
+for qgan_checkpoint_kind in best last; do
+  for qgan_calibration_kind in raw calibrated; do
+    evaluate_if_missing "eval_quant_gan_${qgan_checkpoint_kind}_${qgan_calibration_kind}" \
+      "$ROLLOUT_DIR/quant_gan_paths_${qgan_checkpoint_kind}_${qgan_calibration_kind}.npz" \
+      "$EVAL_DIR/eval_quant_gan_${qgan_checkpoint_kind}_${qgan_calibration_kind}.json"
+  done
+done
+copy_if_missing eval_quant_gan_primary \
+  "$EVAL_DIR/eval_quant_gan_${QGAN_PRIMARY_CHECKPOINT}_calibrated.json" \
+  "$EVAL_DIR/eval_quant_gan.json"
 
 run_if_missing cfg_sweep_summary "$EVAL_DIR/cfg_sweep_summary.txt" \
   python3 scripts/summarize_cfg_sweep.py \
@@ -401,7 +517,7 @@ run_if_missing cfg_sweep_summary "$EVAL_DIR/cfg_sweep_summary.txt" \
     --output "$EVAL_DIR/cfg_sweep_summary.txt" \
     --cfg-weights "$CFG_WEIGHTS"
 
-run_if_missing model_comparison_summary "$EVAL_DIR/model_comparison_summary.md" \
+run_always model_comparison_summary "$EVAL_DIR/model_comparison_summary.md" \
   python3 scripts/summarize_model_comparison.py \
     --eval-dir "$EVAL_DIR" \
     --output "$EVAL_DIR/model_comparison_summary.md"
