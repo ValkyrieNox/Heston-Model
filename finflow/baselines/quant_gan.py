@@ -191,7 +191,11 @@ class QuantGANGenerator(nn.Module):
             ]
         )
         self.output = nn.Conv1d(hidden_channels, 1, kernel_size=1)
-        self.output_norm = nn.LayerNorm(seq_len)
+        # Affine head only: no LayerNorm-over-time (would erase per-path heterogeneity)
+        # and no tanh (would bound outputs and crush heavy tails). Wiese 2020 §3.4
+        # uses a plain linear final layer; the Lambert-W Gaussianization makes the
+        # target distribution near-Gaussian, so heavy tails are recovered by the
+        # inverse Lambert-W transform at sampling time.
         self.output_scale = nn.Parameter(torch.ones(1, 1, 1))
         self.output_shift = nn.Parameter(torch.zeros(1, 1, 1))
 
@@ -199,8 +203,8 @@ class QuantGANGenerator(nn.Module):
         h = self.input_proj(z)
         for block in self.blocks:
             h = block(h)
-        raw = self.output_norm(self.output(h))
-        return self.output_scale * torch.tanh(raw) + self.output_shift
+        raw = self.output(h)
+        return self.output_scale * raw + self.output_shift
 
 
 class QuantGANDiscriminator(nn.Module):
