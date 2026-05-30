@@ -23,6 +23,8 @@ Design docs:
   plan, code-progress index, literature reverse-lookup
 - [idea/2/11_P1Implementation.md](idea/2/11_P1Implementation.md) — P1
   methodology hooks and verification notes
+- [idea/2/13_P2MediumResults.md](idea/2/13_P2MediumResults.md) — P2
+  medium-run results, new-teacher distillation matrix, and failure diagnosis
 
 ## Layout
 
@@ -192,5 +194,8 @@ data + Carr-Madan, Stage 1 teachers, Mean Flow + Consistency distillation,
 unified samplers + autoregressive rollout, the full evaluation suite, and a
 Quant GAN baseline. P1 methodology hooks are also implemented: Mean Flow
 boundary curriculum, ret-stage scheduled sampling, classifier-free guidance,
-and Sig-Wasserstein reporting. Pending V3 future work: longer empirical
-sweeps, per-regime reporting, visualizations, and writeup polish.
+and Sig-Wasserstein reporting. P2 medium experiments are summarized in
+[idea/2/13_P2MediumResults.md](idea/2/13_P2MediumResults.md): the best flow
+result is the new FM teacher last checkpoint, while QGAN last calibrated remains
+the strongest pricing baseline. Pending V3 future work: targeted distillation
+fixes, per-regime reporting, visualizations, and writeup polish.

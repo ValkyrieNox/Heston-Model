@@ -86,6 +86,10 @@ class TransitionFMTrainConfig:
     scheduled_sampling_max_prob: float = 0.0
     scheduled_sampling_start_epoch: int = 1
     scheduled_sampling_fm_steps: int = 20
+    # P3 tuning hooks
+    save_every_epochs: int = 0  # >0: also dump checkpoints/epoch_XXX.pt every N epochs
+    lr_schedule: Literal["constant", "cosine"] = "constant"
+    lr_min: float = 0.0  # eta_min for cosine schedule
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +341,11 @@ def _run_fm_training(
         lr=train_config.lr,
         weight_decay=train_config.weight_decay,
     )
+    scheduler = None
+    if train_config.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(train_config.epochs, 1), eta_min=train_config.lr_min,
+        )
 
     train_loader = build_dataloader(
         datasets["train"], batch_size=train_config.batch_size, shuffle=True,
@@ -364,6 +373,7 @@ def _run_fm_training(
     best_val_loss = float("inf")
     global_step = 0
     history: list[dict[str, Any]] = []
+    epoch_ckpts: list[str] = []
 
     disable_progress = not train_config.progress
     train_batches = _effective_num_batches(train_loader, train_config.max_train_batches)
@@ -412,6 +422,7 @@ def _run_fm_training(
             "val_loss": val_loss,
             "global_step": global_step,
             "epoch_time_s": epoch_time,
+            "lr": optimizer.param_groups[0]["lr"],
         }
         record.update(epoch_extra)
         history.append(record)
@@ -436,6 +447,22 @@ def _run_fm_training(
                 extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
             )
 
+        # Periodic snapshots enable pricing-aware checkpoint selection downstream
+        # (val_loss is known to be a poor proxy for path/pricing quality here).
+        if train_config.save_every_epochs and (epoch % train_config.save_every_epochs == 0):
+            epoch_path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+            save_checkpoint(
+                epoch_path, model, optimizer,
+                epoch=epoch, global_step=global_step, best_val_loss=best_val_loss,
+                model_config=model_config_dict, train_config=asdict(train_config),
+                normalization=normalization, stage=stage, num_actions=num_actions,
+                extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
+            )
+            epoch_ckpts.append(str(epoch_path))
+
+        if scheduler is not None:
+            scheduler.step()
+
         if train_config.progress:
             elapsed = time.monotonic() - run_start
             eta_s = (elapsed / epoch) * (train_config.epochs - epoch)
@@ -456,6 +483,7 @@ def _run_fm_training(
         "checkpoints": {
             "best": str(ckpt_dir / "best.pt"),
             "last": str(ckpt_dir / "last.pt"),
+            "epochs": epoch_ckpts,
         },
         "best_val_loss": best_val_loss,
         "history": history,
