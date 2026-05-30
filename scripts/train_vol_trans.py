@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-batches", type=int, default=None)
     parser.add_argument("--action-dropout-prob", type=float, default=0.1,
                         help="drop action one-hot during training for CFG support")
+    parser.add_argument("--save-every-epochs", type=int, default=0,
+                        help=">0: also dump checkpoints/epoch_XXX.pt every N epochs "
+                             "(for pricing-aware checkpoint selection)")
+    parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
+    parser.add_argument("--lr-min", type=float, default=0.0,
+                        help="eta_min for cosine schedule")
 
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--time-embedding-dim", type=int, default=64)
@@ -75,6 +81,9 @@ def main() -> None:
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
         action_dropout_prob=args.action_dropout_prob,
+        save_every_epochs=args.save_every_epochs,
+        lr_schedule=args.lr_schedule,
+        lr_min=args.lr_min,
     )
     summary = train_vol_trans_fm(
         data_dir=args.data_dir,
