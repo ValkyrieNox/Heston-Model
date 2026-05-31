@@ -41,7 +41,8 @@ NUM_BLOCKS="${NUM_BLOCKS:-6}"
 LR="${LR:-2e-4}"
 LR_SCHEDULE="${LR_SCHEDULE:-cosine}"
 LR_MIN="${LR_MIN:-1e-5}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+CACHE_DATA_DEVICE="${CACHE_DATA_DEVICE:-1}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-5}"
 
 # epochs
@@ -52,6 +53,11 @@ QGAN_EPOCHS="${QGAN_EPOCHS:-30}"
 
 # scheduled sampling is proven to give no benefit on the teacher -> off
 RET_SCHEDULED_MAX_PROB="${RET_SCHEDULED_MAX_PROB:-0}"
+
+CACHE_DATA_ARGS=()
+if [[ "$CACHE_DATA_DEVICE" == "1" ]]; then
+  CACHE_DATA_ARGS=(--cache-data-device)
+fi
 
 # evaluation / selection
 MC_PATHS="${MC_PATHS:-100000}"
@@ -90,6 +96,7 @@ scripts/train.sh \
   --qgan-epochs "$QGAN_EPOCHS" \
   --hidden-dim "$HIDDEN_DIM" --num-blocks "$NUM_BLOCKS" \
   --lr "$LR" --lr-schedule "$LR_SCHEDULE" --lr-min "$LR_MIN" \
+  "${CACHE_DATA_ARGS[@]}" \
   --save-every-epochs "$SAVE_EVERY_EPOCHS" \
   --ret-scheduled-max-prob "$RET_SCHEDULED_MAX_PROB" \
   --device "$DEVICE"
@@ -101,7 +108,7 @@ if [[ -f "$ORACLE" ]]; then
 else
   python3 scripts/generate_mc_oracle.py \
     --data-dir "$DATA_DIR" --output "$ORACLE" \
-    --n-paths "$MC_PATHS" --device "$DEVICE"
+    --n-paths "$MC_PATHS"
 fi
 
 # ============================================================================
@@ -124,6 +131,7 @@ python3 scripts/distill_mean_flow.py --stage vol \
   --teacher-checkpoint "$VOL_CKPT/last.pt" --data-dir "$DATA_DIR" \
   --output-dir "$MF_SELECT_DIR/vol" --run-name mf_vol_select \
   --epochs "$MF_REFINE_EPOCHS" --lr "$MF_REFINE_LR" --batch-size "$BATCH_SIZE" \
+  "${CACHE_DATA_ARGS[@]}" \
   --boundary-prob-start 0.5 --boundary-prob-end 0.1 \
   --identity-residual-eval --device "$DEVICE"
 
@@ -131,6 +139,7 @@ python3 scripts/distill_mean_flow.py --stage ret \
   --teacher-checkpoint "$BEST_RET" --data-dir "$DATA_DIR" \
   --output-dir "$MF_SELECT_DIR/ret" --run-name mf_ret_select \
   --epochs "$MF_REFINE_EPOCHS" --lr "$MF_REFINE_LR" --batch-size "$BATCH_SIZE" \
+  "${CACHE_DATA_ARGS[@]}" \
   --boundary-prob-start 0.5 --boundary-prob-end 0.1 \
   --identity-residual-eval --device "$DEVICE"
 
@@ -154,6 +163,25 @@ python3 scripts/rollout.py \
   --data-dir "$DATA_DIR" --output "$EVAL_DIR/rollout_mf.npz" \
   --n-paths "$EVAL_PATHS" --n-steps "$STEPS" --regime-actions --cfg-w "$CFG_W" \
   --device "$DEVICE"
+
+# Consistency (CD) 1-NFE student — the other distillation route
+CD_VOL="$TRAIN_DIR/cd_vol/cd_vol_${EXP_NAME}/checkpoints/best.pt"
+CD_RET="$TRAIN_DIR/cd_ret/cd_ret_${EXP_NAME}/checkpoints/best.pt"
+if [[ -e "$CD_VOL" && -e "$CD_RET" ]]; then
+  python3 scripts/rollout.py \
+    --vol-checkpoint "$CD_VOL" --ret-checkpoint "$CD_RET" \
+    --data-dir "$DATA_DIR" --output "$EVAL_DIR/rollout_cd.npz" \
+    --n-paths "$EVAL_PATHS" --n-steps "$STEPS" --regime-actions --cfg-w "$CFG_W" \
+    --device "$DEVICE"
+fi
+
+# Quant GAN baseline (best + last, calibrated)
+QG_DIR="$TRAIN_DIR/quant_gan/quant_gan_${EXP_NAME}/checkpoints"
+if [[ -e "$QG_DIR/best.pt" ]]; then
+  python3 scripts/sample_quant_gan.py \
+    --checkpoint "$QG_DIR/best.pt" --output "$EVAL_DIR/quant_gan_paths.npz" \
+    --n-paths "$EVAL_PATHS" --seed 0
+fi
 
 MC_ORACLE="$ORACLE" MONEYNESS="$MONEYNESS" MATURITIES="$MATURITIES" \
   scripts/run_full_evaluation.sh "$EVAL_DIR" "$DATA_DIR/test.npz" "$EVAL_DIR/evaluation"
