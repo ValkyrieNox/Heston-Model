@@ -17,6 +17,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from finflow.transforms import lambert_w_transform
+
 
 class HestonTransitionDataset(Dataset[dict[str, torch.Tensor]]):
     """Single-stage joint dataset (kept for backward compatibility)."""
@@ -73,6 +75,40 @@ class HestonTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "r_next": target[1],
         }
 
+    def as_condition_target_tensors(self) -> dict[str, object]:
+        """Return vectorized tensors for fast whole-dataset GPU caching."""
+
+        log_v_t = self.arrays["log_v_t"].astype(np.float32, copy=False)
+        r_t = self.arrays["r_t"].astype(np.float32, copy=False)
+        log_v_next = self.arrays["log_v_next"].astype(np.float32, copy=False)
+        r_next = self.arrays["r_next"].astype(np.float32, copy=False)
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+            r_t = (r_t - self.return_mean) / self.return_std
+            r_next = (r_next - self.return_mean) / self.return_std
+
+        condition = np.stack(
+            [
+                np.asarray(log_v_t, dtype=np.float32),
+                np.asarray(r_t, dtype=np.float32),
+            ],
+            axis=1,
+        )
+        target = np.stack(
+            [
+                np.asarray(log_v_next, dtype=np.float32),
+                np.asarray(r_next, dtype=np.float32),
+            ],
+            axis=1,
+        )
+        return {
+            "condition": torch.from_numpy(np.ascontiguousarray(condition)),
+            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "action_start": None,
+            "action_dropout_prob": 0.0,
+        }
+
 
 def _load_action_array(npz_files: list[str], npz: np.lib.npyio.NpzFile, n: int) -> np.ndarray:
     if "action" in npz_files:
@@ -103,6 +139,15 @@ def _maybe_drop_action(action_onehot: torch.Tensor, prob: float) -> torch.Tensor
     return action_onehot
 
 
+def _one_hot_matrix(actions: np.ndarray, dim: int) -> np.ndarray:
+    actions = np.asarray(actions, dtype=np.int64)
+    if np.any((actions < 0) | (actions >= dim)):
+        raise IndexError(f"action index out of range [0, {dim})")
+    out = np.zeros((actions.shape[0], dim), dtype=np.float32)
+    out[np.arange(actions.shape[0]), actions] = 1.0
+    return out
+
+
 class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
     """V3 Stage 1a: variance transition kernel.
 
@@ -118,6 +163,7 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
         log_v_std: float = 1.0,
         num_actions: int = 1,
         action_dropout_prob: float = 0.0,
+        lambert_w_delta: float = 0.0,
     ) -> None:
         self.path = Path(path)
         self.normalize = normalize
@@ -125,6 +171,13 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
         self.log_v_std = float(log_v_std)
         self.num_actions = int(num_actions)
         self.action_dropout_prob = _validate_action_dropout_prob(action_dropout_prob)
+        # Lambert-W Gaussianization of the (normalized) log-variance TARGET only.
+        # The condition log_v_t stays in the raw normalized domain so the
+        # autoregressive rollout can feed back inverse-transformed samples
+        # unchanged. delta=0 -> identity (default, no behavior change).
+        self.lambert_w_delta = float(lambert_w_delta)
+        if self.lambert_w_delta < 0:
+            raise ValueError("lambert_w_delta must be non-negative")
         if self.log_v_std <= 0:
             raise ValueError("log_v_std must be positive")
         if self.num_actions <= 0:
@@ -159,6 +212,10 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
         if self.normalize:
             log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
             log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+        if self.lambert_w_delta > 0.0:
+            log_v_next = float(lambert_w_transform(
+                np.asarray([log_v_next], dtype=np.float64), delta=self.lambert_w_delta,
+            )[0])
 
         a_onehot = _maybe_drop_action(_one_hot(action, self.num_actions), self.action_dropout_prob)
         condition = torch.cat([torch.tensor([log_v_t], dtype=torch.float32), a_onehot])
@@ -169,6 +226,32 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "log_v_t": torch.tensor(log_v_t, dtype=torch.float32),
             "log_v_next": target[0],
             "action": torch.tensor(action, dtype=torch.long),
+        }
+
+    def as_condition_target_tensors(self) -> dict[str, object]:
+        """Return vectorized tensors for fast whole-dataset GPU caching."""
+
+        log_v_t = self.log_v_t.astype(np.float32, copy=False)
+        log_v_next = self.log_v_next.astype(np.float32, copy=False)
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+        if self.lambert_w_delta > 0.0:
+            log_v_next = lambert_w_transform(log_v_next, delta=self.lambert_w_delta)
+
+        condition = np.concatenate(
+            [
+                np.asarray(log_v_t, dtype=np.float32).reshape(-1, 1),
+                _one_hot_matrix(self.action, self.num_actions),
+            ],
+            axis=1,
+        )
+        target = np.asarray(log_v_next, dtype=np.float32).reshape(-1, 1)
+        return {
+            "condition": torch.from_numpy(np.ascontiguousarray(condition)),
+            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "action_start": 1,
+            "action_dropout_prob": self.action_dropout_prob,
         }
 
 
@@ -256,4 +339,39 @@ class HestonRetTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "r_t": torch.tensor(r_t, dtype=torch.float32),
             "r_next": target[0],
             "action": torch.tensor(action, dtype=torch.long),
+        }
+
+    def as_condition_target_tensors(self) -> dict[str, object]:
+        """Return vectorized tensors for fast whole-dataset GPU caching."""
+
+        log_v_t = self.log_v_t.astype(np.float32, copy=False)
+        log_v_next = self.log_v_next.astype(np.float32, copy=False)
+        r_t = self.r_t.astype(np.float32, copy=False)
+        r_next = self.r_next.astype(np.float32, copy=False)
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+            r_t = (r_t - self.return_mean) / self.return_std
+            r_next = (r_next - self.return_mean) / self.return_std
+
+        condition = np.concatenate(
+            [
+                np.stack(
+                    [
+                        np.asarray(log_v_next, dtype=np.float32),
+                        np.asarray(log_v_t, dtype=np.float32),
+                        np.asarray(r_t, dtype=np.float32),
+                    ],
+                    axis=1,
+                ),
+                _one_hot_matrix(self.action, self.num_actions),
+            ],
+            axis=1,
+        )
+        target = np.asarray(r_next, dtype=np.float32).reshape(-1, 1)
+        return {
+            "condition": torch.from_numpy(np.ascontiguousarray(condition)),
+            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "action_start": 3,
+            "action_dropout_prob": self.action_dropout_prob,
         }
