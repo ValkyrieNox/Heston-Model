@@ -29,6 +29,10 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+# Enable TensorFloat32 for faster matmul on Ampere+ GPUs (RTX 30/40, A100, etc.)
+torch.set_float32_matmul_precision('high')
+torch.backends.cudnn.benchmark = True
+
 from finflow.data import (
     HestonRetTransitionDataset,
     HestonTransitionDataset,
@@ -332,11 +336,30 @@ def _run_fm_training(
 ) -> dict[str, Any]:
     device = resolve_device(train_config.device)
     model = model.to(device)
+
+    # Note: torch.compile disabled on Windows due to Triton compatibility issues
+    # Uncomment below on Linux for 10-30% speedup:
+    # if device.type == "cuda" and hasattr(torch, "compile"):
+    #     try:
+    #         model = torch.compile(model, mode="reduce-overhead")
+    #     except Exception:
+    #         pass
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.lr,
         weight_decay=train_config.weight_decay,
     )
+
+    # Cosine annealing LR schedule with warmup
+    warmup_epochs = max(1, train_config.epochs // 10)
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, train_config.epochs - warmup_epochs)
+        return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159)).item())
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     train_loader = build_dataloader(
         datasets["train"], batch_size=train_config.batch_size, shuffle=True,
@@ -436,14 +459,18 @@ def _run_fm_training(
                 extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
             )
 
+        scheduler.step()
+
         if train_config.progress:
             elapsed = time.monotonic() - run_start
             eta_s = (elapsed / epoch) * (train_config.epochs - epoch)
+            current_lr = optimizer.param_groups[0]['lr']
             line = (
                 f"  epoch {epoch:>3}/{train_config.epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
                 f"{_format_epoch_extra(epoch_extra)}"
                 f"best={best_val_loss:.4f}{' *' if is_best else '  '} | "
+                f"lr={current_lr:.2e} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}"
             )
