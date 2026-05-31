@@ -59,6 +59,30 @@ def test_vol_trans_fm_smoke(tmp_path: Path) -> None:
     assert eval_result["stage"] == "vol"
 
 
+def test_vol_trans_fm_cache_data_device_smoke(tmp_path: Path) -> None:
+    data_dir, num_actions = _generate_smoke_data(tmp_path)
+    summary = train_vol_trans_fm(
+        data_dir=data_dir,
+        output_dir=tmp_path / "runs_vol_cache",
+        run_name="vol_cache",
+        num_actions=num_actions,
+        model_config=TwoStageFMModelConfig(
+            state_dim=1, condition_dim=1 + num_actions,
+            hidden_dim=16, time_embedding_dim=8, num_blocks=2,
+        ),
+        train_config=TransitionFMTrainConfig(
+            **{
+                **_SHARED_TRAIN_KW,
+                "epochs": 1,
+                "max_train_batches": 1,
+                "cache_data_device": True,
+            }
+        ),
+    )
+    assert Path(summary["checkpoints"]["best"]).exists()
+    assert summary["history"][0]["global_step"] == 1
+
+
 def test_ret_trans_fm_smoke(tmp_path: Path) -> None:
     data_dir, num_actions = _generate_smoke_data(tmp_path)
     summary = train_ret_trans_fm(
