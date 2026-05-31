@@ -28,9 +28,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-actions", type=int, default=None,
                         help="Override action dim; default auto-detected from metadata.")
 
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=131072)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--time-eps", type=float, default=1e-4)
@@ -43,9 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-dropout-prob", type=float, default=0.1,
                         help="drop action one-hot during training for CFG support")
 
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--time-embedding-dim", type=int, default=64)
-    parser.add_argument("--num-blocks", type=int, default=4)
+    parser.add_argument("--hidden-dim", type=int, default=1024)
+    parser.add_argument("--time-embedding-dim", type=int, default=128)
+    parser.add_argument("--num-blocks", type=int, default=12)
     return parser.parse_args()
 
 
