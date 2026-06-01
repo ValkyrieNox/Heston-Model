@@ -66,6 +66,8 @@ class PathwiseTeacherFineTuneConfig:
     seed: int = 1234
     device: str = "auto"
     progress: bool = True
+    compile_models: bool = False
+    compile_mode: str = "reduce-overhead"
 
 
 class ReturnPathBatcher:
@@ -114,14 +116,23 @@ def _onehot(actions: torch.Tensor, num_actions: int) -> torch.Tensor:
     return F.one_hot(actions.long(), num_classes=num_actions).to(actions.device).float()
 
 
+def _onehot_sequence(actions: torch.Tensor, num_actions: int, dtype: torch.dtype) -> torch.Tensor:
+    return F.one_hot(actions.long(), num_classes=num_actions).to(device=actions.device, dtype=dtype)
+
+
+def _fm_tau_grid(n_steps: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.arange(n_steps, device=device, dtype=dtype) / float(n_steps)
+
+
 def _fm_sample_with_grad(
-    model: TransitionFM,
+    model: nn.Module,
     condition: torch.Tensor,
     *,
     noise: torch.Tensor,
     n_steps: int,
     num_actions: int,
     cfg_w: float = 0.0,
+    tau_grid: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if n_steps <= 0:
         raise ValueError("n_steps must be positive")
@@ -133,7 +144,10 @@ def _fm_sample_with_grad(
     dt = 1.0 / n_steps
     batch = condition.shape[0]
     for step in range(n_steps):
-        tau = torch.full((batch,), step * dt, device=condition.device, dtype=condition.dtype)
+        if tau_grid is None:
+            tau = torch.full((batch,), step * dt, device=condition.device, dtype=condition.dtype)
+        else:
+            tau = tau_grid[step].expand(batch)
         velocity = model(x_tau=x, tau=tau, condition=condition)
         if unconditional is not None:
             velocity_uncond = model(x_tau=x, tau=tau, condition=unconditional)
@@ -143,8 +157,8 @@ def _fm_sample_with_grad(
 
 
 def _differentiable_rollout_norm(
-    vol_model: TransitionFM,
-    ret_model: TransitionFM,
+    vol_model: nn.Module,
+    ret_model: nn.Module,
     actions: torch.Tensor,
     *,
     normalization: dict[str, float],
@@ -154,6 +168,7 @@ def _differentiable_rollout_norm(
     fm_n_steps: int,
     vol_lambert_w_delta: float,
     cfg_w: float = 0.0,
+    action_features: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Roll out normalized returns with gradients flowing to FM models."""
 
@@ -168,15 +183,18 @@ def _differentiable_rollout_norm(
     r0 = (initial_r_prev - return_mean) / return_std
     log_v_t = torch.full((batch, 1), float(log_v0), device=device, dtype=dtype)
     r_prev_t = torch.full((batch, 1), float(r0), device=device, dtype=dtype)
+    if action_features is None:
+        action_features = _onehot_sequence(actions, num_actions, dtype)
+    tau_grid = _fm_tau_grid(fm_n_steps, device=device, dtype=dtype)
     out: list[torch.Tensor] = []
 
     for step in range(n_steps):
-        a_onehot = _onehot(actions[:, step], num_actions).to(dtype=dtype)
+        a_onehot = action_features[:, step, :]
         vol_cond = torch.cat([log_v_t, a_onehot], dim=-1)
         z_vol = torch.randn(batch, 1, device=device, dtype=dtype)
         log_v_next = _fm_sample_with_grad(
             vol_model, vol_cond, noise=z_vol, n_steps=fm_n_steps,
-            num_actions=num_actions, cfg_w=cfg_w,
+            num_actions=num_actions, cfg_w=cfg_w, tau_grid=tau_grid,
         )
         if vol_lambert_w_delta > 0.0:
             log_v_next = inverse_lambert_w_transform_torch(
@@ -187,7 +205,7 @@ def _differentiable_rollout_norm(
         z_ret = torch.randn(batch, 1, device=device, dtype=dtype)
         r_next = _fm_sample_with_grad(
             ret_model, ret_cond, noise=z_ret, n_steps=fm_n_steps,
-            num_actions=num_actions, cfg_w=cfg_w,
+            num_actions=num_actions, cfg_w=cfg_w, tau_grid=tau_grid,
         )
         out.append(r_next)
         log_v_t = log_v_next
@@ -277,6 +295,15 @@ def _anchor_loss(models: list[nn.Module], anchors: dict[str, torch.Tensor]) -> t
     return total
 
 
+def _maybe_compile_model(model: nn.Module, *, enabled: bool, mode: str) -> nn.Module:
+    if not enabled:
+        return model
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        raise RuntimeError("torch.compile is not available in this PyTorch build")
+    return compile_fn(model, mode=mode)
+
+
 def _save_finetuned_checkpoint(
     path: Path,
     model: TransitionFM,
@@ -355,6 +382,9 @@ def train_pathwise_teacher_finetune(
         num_blocks=config.critic_num_blocks,
         kernel_size=config.critic_kernel_size,
     ).to(device)
+    vol_forward = _maybe_compile_model(vol_model, enabled=config.compile_models, mode=config.compile_mode)
+    ret_forward = _maybe_compile_model(ret_model, enabled=config.compile_models, mode=config.compile_mode)
+    critic_forward = _maybe_compile_model(critic, enabled=config.compile_models, mode=config.compile_mode)
 
     teacher_params = [p for p in list(vol_model.parameters()) + list(ret_model.parameters()) if p.requires_grad]
     teacher_optimizer = torch.optim.AdamW(teacher_params, lr=config.lr_teacher)
@@ -400,21 +430,23 @@ def train_pathwise_teacher_finetune(
         for _ in range(config.steps_per_epoch):
             for _critic_step in range(config.critic_steps):
                 real_norm, actions = batcher.sample(config.batch_size)
+                action_features = _onehot_sequence(actions, num_actions, next(ret_model.parameters()).dtype)
                 with torch.no_grad():
                     fake_norm = _differentiable_rollout_norm(
-                        vol_model, ret_model, actions,
+                        vol_forward, ret_forward, actions,
                         normalization=normalization,
                         num_actions=num_actions,
                         initial_v=config.initial_v,
                         initial_r_prev=config.initial_r_prev,
                         fm_n_steps=config.fm_n_steps,
                         vol_lambert_w_delta=vol_lambert_w_delta,
+                        action_features=action_features,
                     )
                 real_c = _critic_domain(real_norm, config.transform_delta)
                 fake_c = _critic_domain(fake_norm, config.transform_delta)
-                d_real = critic(real_c)
-                d_fake = critic(fake_c)
-                gp = _gradient_penalty(critic, real_c, fake_c)
+                d_real = critic_forward(real_c)
+                d_fake = critic_forward(fake_c)
+                gp = _gradient_penalty(critic_forward, real_c, fake_c)
                 critic_loss = d_fake.mean() - d_real.mean() + config.gradient_penalty_weight * gp
                 critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
@@ -423,17 +455,19 @@ def train_pathwise_teacher_finetune(
             for param in critic.parameters():
                 param.requires_grad_(False)
             real_norm, actions = batcher.sample(config.batch_size)
+            action_features = _onehot_sequence(actions, num_actions, next(ret_model.parameters()).dtype)
             fake_norm = _differentiable_rollout_norm(
-                vol_model, ret_model, actions,
+                vol_forward, ret_forward, actions,
                 normalization=normalization,
                 num_actions=num_actions,
                 initial_v=config.initial_v,
                 initial_r_prev=config.initial_r_prev,
                 fm_n_steps=config.fm_n_steps,
                 vol_lambert_w_delta=vol_lambert_w_delta,
+                action_features=action_features,
             )
             fake_c = _critic_domain(fake_norm, config.transform_delta)
-            adv_loss = -critic(fake_c).mean()
+            adv_loss = -critic_forward(fake_c).mean()
             moment_loss = _path_moment_loss(fake_norm, real_norm, config)
             anchor = _anchor_loss(models, anchors) if config.anchor_weight > 0.0 else fake_norm.new_tensor(0.0)
             generator_loss = adv_loss + moment_loss + config.anchor_weight * anchor

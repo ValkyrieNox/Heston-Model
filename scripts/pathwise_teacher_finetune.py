@@ -54,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--compile-models", action="store_true",
+                        help="use torch.compile on the FM teachers and path critic")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
     return parser.parse_args()
 
 
@@ -88,6 +91,8 @@ def main() -> None:
         seed=args.seed,
         device=args.device,
         progress=not args.no_progress,
+        compile_models=args.compile_models,
+        compile_mode=args.compile_mode,
     )
     summary = train_pathwise_teacher_finetune(
         vol_checkpoint=args.vol_checkpoint,

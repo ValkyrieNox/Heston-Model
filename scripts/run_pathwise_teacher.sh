@@ -28,6 +28,8 @@ FM_N_STEPS="${FM_N_STEPS:-8}"
 LR_TEACHER="${LR_TEACHER:-1e-5}"
 LR_CRITIC="${LR_CRITIC:-2e-4}"
 CRITIC_STEPS="${CRITIC_STEPS:-3}"
+COMPILE_MODELS="${COMPILE_MODELS:-0}"
+COMPILE_MODE="${COMPILE_MODE:-reduce-overhead}"
 EVAL_PATHS="${EVAL_PATHS:-10000}"
 MONEYNESS="${MONEYNESS:-0.85 0.90 0.95 1.00 1.05}"
 MATURITIES="${MATURITIES:-0.25 0.5 1.0}"
@@ -49,6 +51,8 @@ RET="${RET:-$(python3 -c "import json;print(json.load(open('$EXP_DIR/selection_r
 [[ -e "$RET" ]] || { echo "missing RET checkpoint: $RET" >&2; exit 1; }
 
 RUN_NAME="${RUN_NAME:-pathwise_lwfm_d${DELTA}}"
+COMPILE_ARGS=()
+[[ "$COMPILE_MODELS" == "1" ]] && COMPILE_ARGS=(--compile-models --compile-mode "$COMPILE_MODE")
 python3 scripts/pathwise_teacher_finetune.py \
   --vol-checkpoint "$VOL" \
   --ret-checkpoint "$RET" \
@@ -63,7 +67,8 @@ python3 scripts/pathwise_teacher_finetune.py \
   --lr-teacher "$LR_TEACHER" \
   --lr-critic "$LR_CRITIC" \
   --critic-steps "$CRITIC_STEPS" \
-  --device "$DEVICE"
+  --device "$DEVICE" \
+  "${COMPILE_ARGS[@]}"
 
 PW="$TRAIN/pathwise_teacher/$RUN_NAME/checkpoints"
 python3 scripts/rollout.py \
