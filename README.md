@@ -14,6 +14,9 @@ described in [idea/2/02_pipelines.md](idea/2/02_pipelines.md):
 - **Evaluation**: 5 Cont (2001) stylized facts + marginal/path Wasserstein-1 +
   Carr-Madan or MC-oracle pricing RMSE / MAPE.
 - **Baseline**: Quant GAN with Lambert-W preprocessing and WGAN-GP.
+- **Teacher tuning**: Lambert-W variance-kernel sweeps and optional
+  QGAN-style pathwise critic fine-tuning, both written to separate run
+  directories so prior evaluation outputs remain reproducible.
 
 Design docs:
 - [idea/2/02_pipelines.md](idea/2/02_pipelines.md) — V1 / V2 / V3 framing
@@ -36,7 +39,7 @@ finflow/
   eval/                    # stylized facts + distances + pricing + report builder
   baselines/               # Quant GAN (TCN + Lambert-W + WGAN-GP)
 scripts/                   # CLI entry points (one per command)
-tests/                     # full pytest suite (82 tests)
+tests/                     # full pytest suite (86 tests)
 ```
 
 ## End-to-end workflow
@@ -102,6 +105,16 @@ python3 scripts/rollout.py \
 
 # Same script also works with FM teacher or CD checkpoints (auto-detected).
 
+# Optional fair sampling-time calibration, matching Quant GAN's affine
+# mean/std correction:
+python3 scripts/rollout.py \
+  --vol-checkpoint runs/vol_fm/<run>/checkpoints/best.pt \
+  --ret-checkpoint runs/ret_fm/<run>/checkpoints/best.pt \
+  --data-dir data/heston_v3 \
+  --output runs/rollout_fm_calibrated.npz \
+  --n-paths 10000 --n-steps 252 --regime-actions \
+  --calibrate-moments
+
 # --- 5) evaluation --------------------------------------------------------
 python3 scripts/generate_mc_oracle.py \
   --data-dir data/heston_v3 --output data/heston_v3/mc_oracle.npz \
@@ -138,6 +151,28 @@ python3 scripts/evaluate_rollout.py \
 
 scripts/run_full_evaluation.sh runs data/heston_v3/test.npz runs/evaluation
 ```
+
+## Teacher Tuning
+
+The current teacher-improvement path is intentionally additive: it does not
+remove or overwrite prior result-generation code.
+
+```bash
+# Reproduce / extend the Lambert-W variance-kernel sweep used for eval_lwfm/.
+# This trains only new vol kernels and reuses the selected return teacher.
+DELTAS="0.03 0.05 0.08 0.12" \
+  bash scripts/lwfm_vol_sweep.sh runs/experiments/p3_full_parallel
+
+# Next experimental step: start from the best LWFM teacher and fine-tune with a
+# whole-path TCN critic, borrowing Quant GAN's sequence-level objective while
+# keeping the two-stage FM structure.
+DELTA=0.05 EPOCHS=3 STEPS_PER_EPOCH=100 \
+  bash scripts/run_pathwise_teacher.sh runs/experiments/p3_full_parallel
+```
+
+The pathwise run writes to `training/pathwise_teacher/` and
+`eval_pathwise/`. It leaves `eval_lwfm/`, `eval_champion/`, and
+`eval_calibrated/` untouched.
 
 `num_actions` is auto-read from `metadata.json` at every step. Drop `--regimes`
 on data generation to use a single fixed parameter set; everything downstream

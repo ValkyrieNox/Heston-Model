@@ -29,10 +29,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-# Enable TensorFloat32 for faster matmul on Ampere+ GPUs (RTX 30/40, A100, etc.)
-torch.set_float32_matmul_precision('high')
-torch.backends.cudnn.benchmark = True
-
 from finflow.data import (
     HestonRetTransitionDataset,
     HestonTransitionDataset,
@@ -79,6 +75,7 @@ class TransitionFMTrainConfig:
     grad_clip_norm: float = 1.0
     time_eps: float = 1e-4
     num_workers: int = 0
+    cache_data_device: bool = False
     seed: int = 1234
     device: str = "auto"
     log_every: int = 50
@@ -90,6 +87,10 @@ class TransitionFMTrainConfig:
     scheduled_sampling_max_prob: float = 0.0
     scheduled_sampling_start_epoch: int = 1
     scheduled_sampling_fm_steps: int = 20
+    # P3 tuning hooks
+    save_every_epochs: int = 0  # >0: also dump checkpoints/epoch_XXX.pt every N epochs
+    lr_schedule: Literal["constant", "cosine"] = "constant"
+    lr_min: float = 0.0  # eta_min for cosine schedule
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +135,106 @@ def load_num_actions(data_dir: str | Path) -> int:
     return int(metadata.get("num_actions", 1))
 
 
+class TensorBatchLoader:
+    """Minimal batch loader over prebuilt condition/target tensors.
+
+    This is intended for very small per-sample tabular tensors where PyTorch's
+    map-style DataLoader spends most of its time constructing Python objects.
+    """
+
+    def __init__(
+        self,
+        condition: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        device: torch.device,
+        action_start: int | None = None,
+        action_dropout_prob: float = 0.0,
+    ) -> None:
+        if condition.shape[0] != target.shape[0]:
+            raise ValueError("condition and target must have the same length")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.condition = condition.to(device, non_blocking=True).contiguous()
+        self.target = target.to(device, non_blocking=True).contiguous()
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.device = device
+        self.action_start = action_start
+        self.action_dropout_prob = float(action_dropout_prob)
+
+    def __len__(self) -> int:
+        n = int(self.condition.shape[0])
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        n = int(self.condition.shape[0])
+        if self.shuffle:
+            order = torch.randperm(n, device=self.device)
+            for start in range(0, n, self.batch_size):
+                idx = order[start:start + self.batch_size]
+                condition = self.condition.index_select(0, idx)
+                target = self.target.index_select(0, idx)
+                yield self._make_batch(condition, target)
+        else:
+            for start in range(0, n, self.batch_size):
+                end = min(start + self.batch_size, n)
+                yield self._make_batch(self.condition[start:end], self.target[start:end])
+
+    def _make_batch(self, condition: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.action_start is not None and self.action_dropout_prob > 0.0:
+            condition = condition.clone()
+            keep = (
+                torch.rand(condition.shape[0], 1, device=condition.device)
+                >= self.action_dropout_prob
+            ).to(dtype=condition.dtype)
+            condition[:, self.action_start:] *= keep
+        return {"condition": condition, "target": target}
+
+
 def build_dataloader(
     dataset: Dataset,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
     device: torch.device,
-) -> DataLoader:
+) -> DataLoader | TensorBatchLoader:
+    return build_batch_loader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        device=device,
+        cache_on_device=False,
+    )
+
+
+def build_batch_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    device: torch.device,
+    cache_on_device: bool,
+) -> DataLoader | TensorBatchLoader:
+    if cache_on_device:
+        if not hasattr(dataset, "as_condition_target_tensors"):
+            raise TypeError(
+                f"{type(dataset).__name__} does not support cache_data_device"
+            )
+        tensors = dataset.as_condition_target_tensors()
+        return TensorBatchLoader(
+            tensors["condition"],
+            tensors["target"],
+            batch_size=batch_size,
+            shuffle=shuffle,
+            device=device,
+            action_start=tensors.get("action_start"),
+            action_dropout_prob=float(tensors.get("action_dropout_prob", 0.0)),
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -191,7 +285,7 @@ def _make_progress(
 
 def evaluate_model(
     model: TransitionFM,
-    loader: DataLoader,
+    loader: DataLoader | TensorBatchLoader,
     device: torch.device,
     time_eps: float,
     max_batches: int | None = None,
@@ -226,7 +320,7 @@ def evaluate_model(
 
 def train_one_epoch(
     model: TransitionFM,
-    loader: DataLoader,
+    loader: DataLoader | TensorBatchLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     time_eps: float,
@@ -329,6 +423,7 @@ def _run_fm_training(
     stage: str,
     num_actions: int,
     config_blob_extra: dict[str, Any] | None = None,
+    checkpoint_extra: dict[str, Any] | None = None,
     train_condition_transform_factory: (
         Callable[[int], tuple[Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor] | None, dict[str, Any]]]
         | None
@@ -336,38 +431,26 @@ def _run_fm_training(
 ) -> dict[str, Any]:
     device = resolve_device(train_config.device)
     model = model.to(device)
-
-    # Note: torch.compile disabled on Windows due to Triton compatibility issues
-    # Uncomment below on Linux for 10-30% speedup:
-    # if device.type == "cuda" and hasattr(torch, "compile"):
-    #     try:
-    #         model = torch.compile(model, mode="reduce-overhead")
-    #     except Exception:
-    #         pass
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.lr,
         weight_decay=train_config.weight_decay,
     )
+    scheduler = None
+    if train_config.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(train_config.epochs, 1), eta_min=train_config.lr_min,
+        )
 
-    # Cosine annealing LR schedule with warmup
-    warmup_epochs = max(1, train_config.epochs // 10)
-    def lr_lambda(epoch: int) -> float:
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, train_config.epochs - warmup_epochs)
-        return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159)).item())
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    train_loader = build_dataloader(
+    train_loader = build_batch_loader(
         datasets["train"], batch_size=train_config.batch_size, shuffle=True,
         num_workers=train_config.num_workers, device=device,
+        cache_on_device=train_config.cache_data_device,
     )
-    val_loader = build_dataloader(
+    val_loader = build_batch_loader(
         datasets["val"], batch_size=train_config.batch_size, shuffle=False,
         num_workers=train_config.num_workers, device=device,
+        cache_on_device=train_config.cache_data_device,
     )
 
     config_blob = {
@@ -387,6 +470,8 @@ def _run_fm_training(
     best_val_loss = float("inf")
     global_step = 0
     history: list[dict[str, Any]] = []
+    epoch_ckpts: list[str] = []
+    extra_base = dict(checkpoint_extra or {})
 
     disable_progress = not train_config.progress
     train_batches = _effective_num_batches(train_loader, train_config.max_train_batches)
@@ -396,6 +481,7 @@ def _run_fm_training(
     if train_config.progress:
         header = (
             f"[finflow] stage={stage} | run={run_dir.name} | device={device} | "
+            f"cache_data_device={int(train_config.cache_data_device)} | "
             f"params={n_params/1e3:.1f}k | train={len(datasets['train'])} samples "
             f"({train_batches} batch/epoch x {train_config.batch_size}) | "
             f"val={len(datasets['val'])} samples ({val_batches} batch) | epochs={train_config.epochs}"
@@ -435,6 +521,7 @@ def _run_fm_training(
             "val_loss": val_loss,
             "global_step": global_step,
             "epoch_time_s": epoch_time,
+            "lr": optimizer.param_groups[0]["lr"],
         }
         record.update(epoch_extra)
         history.append(record)
@@ -446,7 +533,7 @@ def _run_fm_training(
             epoch=epoch, global_step=global_step, best_val_loss=best_val_loss,
             model_config=model_config_dict, train_config=asdict(train_config),
             normalization=normalization, stage=stage, num_actions=num_actions,
-            extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
+            extra={"train_loss": train_loss, "val_loss": val_loss, **extra_base, **epoch_extra},
         )
         is_best = val_loss < best_val_loss
         if is_best:
@@ -456,21 +543,33 @@ def _run_fm_training(
                 epoch=epoch, global_step=global_step, best_val_loss=best_val_loss,
                 model_config=model_config_dict, train_config=asdict(train_config),
                 normalization=normalization, stage=stage, num_actions=num_actions,
-                extra={"train_loss": train_loss, "val_loss": val_loss, **epoch_extra},
+                extra={"train_loss": train_loss, "val_loss": val_loss, **extra_base, **epoch_extra},
             )
 
-        scheduler.step()
+        # Periodic snapshots enable pricing-aware checkpoint selection downstream
+        # (val_loss is known to be a poor proxy for path/pricing quality here).
+        if train_config.save_every_epochs and (epoch % train_config.save_every_epochs == 0):
+            epoch_path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+            save_checkpoint(
+                epoch_path, model, optimizer,
+                epoch=epoch, global_step=global_step, best_val_loss=best_val_loss,
+                model_config=model_config_dict, train_config=asdict(train_config),
+                normalization=normalization, stage=stage, num_actions=num_actions,
+                extra={"train_loss": train_loss, "val_loss": val_loss, **extra_base, **epoch_extra},
+            )
+            epoch_ckpts.append(str(epoch_path))
+
+        if scheduler is not None:
+            scheduler.step()
 
         if train_config.progress:
             elapsed = time.monotonic() - run_start
             eta_s = (elapsed / epoch) * (train_config.epochs - epoch)
-            current_lr = optimizer.param_groups[0]['lr']
             line = (
                 f"  epoch {epoch:>3}/{train_config.epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
                 f"{_format_epoch_extra(epoch_extra)}"
                 f"best={best_val_loss:.4f}{' *' if is_best else '  '} | "
-                f"lr={current_lr:.2e} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}"
             )
@@ -483,6 +582,7 @@ def _run_fm_training(
         "checkpoints": {
             "best": str(ckpt_dir / "best.pt"),
             "last": str(ckpt_dir / "last.pt"),
+            "epochs": epoch_ckpts,
         },
         "best_val_loss": best_val_loss,
         "history": history,
@@ -638,6 +738,7 @@ def build_vol_datasets(
     normalization: dict[str, float],
     num_actions: int,
     train_action_dropout_prob: float = 0.0,
+    lambert_w_delta: float = 0.0,
 ) -> dict[str, HestonVolTransitionDataset]:
     data_dir = Path(data_dir)
     return {
@@ -648,6 +749,7 @@ def build_vol_datasets(
             log_v_std=normalization["log_v_std"],
             num_actions=num_actions,
             action_dropout_prob=train_action_dropout_prob if split == "train" else 0.0,
+            lambert_w_delta=lambert_w_delta,
         )
         for split in ("train", "val", "test")
     }
@@ -660,11 +762,17 @@ def train_vol_trans_fm(
     num_actions: int | None = None,
     model_config: TwoStageFMModelConfig | None = None,
     train_config: TransitionFMTrainConfig | None = None,
+    lambert_w_delta: float = 0.0,
 ) -> dict[str, Any]:
     """Train Stage 1a: ``p(v_{t+1} | v_t, a_t)``.
 
     If ``num_actions`` is None it is read from the data ``metadata.json``.
     ``model_config`` defaults to ``state_dim=1, condition_dim=1+num_actions``.
+
+    ``lambert_w_delta > 0`` trains the variance kernel in a Lambert-W
+    Gaussianized target domain (heavy-tail trick borrowed from the Quant GAN
+    baseline). The delta is stored in the checkpoint so the sampler inverts it
+    automatically at rollout. Default 0 -> identity (unchanged behavior).
     """
 
     train_config = train_config or TransitionFMTrainConfig()
@@ -676,6 +784,7 @@ def train_vol_trans_fm(
     datasets = build_vol_datasets(
         data_dir, normalization, num_actions,
         train_action_dropout_prob=train_config.action_dropout_prob,
+        lambert_w_delta=lambert_w_delta,
     )
 
     if model_config is None:
@@ -703,7 +812,11 @@ def train_vol_trans_fm(
         model_config_dict=asdict(model_config),
         stage="vol",
         num_actions=num_actions,
-        config_blob_extra={"data_dir": str(Path(data_dir).resolve())},
+        config_blob_extra={
+            "data_dir": str(Path(data_dir).resolve()),
+            "lambert_w_delta": float(lambert_w_delta),
+        },
+        checkpoint_extra={"lambert_w_delta": float(lambert_w_delta)},
     )
 
 

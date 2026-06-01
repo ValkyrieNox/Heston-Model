@@ -163,22 +163,12 @@ def conditional_flow_matching_loss(
     target: torch.Tensor,
     time_eps: float = 1e-4,
     reduction: Literal["mean", "none"] = "mean",
-    huber_delta: float = 1.0,
 ) -> torch.Tensor:
-    """Compute conditional FM loss for normalized transitions.
-
-    Uses Huber loss (smooth L1) instead of MSE to be more robust to outliers
-    in financial return distributions. huber_delta controls the transition point
-    between quadratic (|error| < delta) and linear (|error| >= delta) regimes.
-    """
+    """Compute conditional FM MSE loss for normalized transitions."""
 
     x_tau, tau, velocity, _ = sample_conditional_flow_batch(target=target, time_eps=time_eps)
     prediction = model(x_tau=x_tau, tau=tau, condition=condition)
-
-    # Huber loss: quadratic for small errors, linear for large errors
-    # More robust to the heavy tails in financial returns
-    per_dim_loss = F.huber_loss(prediction, velocity, delta=huber_delta, reduction='none')
-
+    per_dim_loss = (prediction - velocity).pow(2)
     if reduction == "mean":
         return per_dim_loss.mean()
     if reduction == "none":
