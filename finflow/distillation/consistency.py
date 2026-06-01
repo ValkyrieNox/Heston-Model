@@ -315,9 +315,14 @@ def train_consistency_distill(
         )
     num_actions = int(teacher_ckpt.get("num_actions", load_num_actions(data_dir)))
     normalization = teacher_ckpt.get("normalization") or load_normalization(data_dir)
+    teacher_extra = teacher_ckpt.get("extra", {})
+    teacher_lambert_w_delta = float(teacher_extra.get("lambert_w_delta", 0.0) or 0.0)
 
     if stage == "vol":
-        datasets = build_vol_datasets(data_dir, normalization, num_actions)
+        datasets = build_vol_datasets(
+            data_dir, normalization, num_actions,
+            lambert_w_delta=teacher_lambert_w_delta,
+        )
         expected_state, expected_cond = 1, 1 + num_actions
     else:
         datasets = build_ret_datasets(data_dir, normalization, num_actions)
@@ -382,6 +387,7 @@ def train_consistency_distill(
         "student_config": asdict(student_config),
         "distill_config": asdict(distill_config),
         "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
+        "teacher_lambert_w_delta": teacher_lambert_w_delta,
         "warm_started_params": warm_copied,
         "normalization": normalization,
         "data_dir": str(Path(data_dir).resolve()),
@@ -475,6 +481,7 @@ def train_consistency_distill(
             extra={
                 "train_loss": train_loss, "val_loss": val_loss,
                 "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
+                "lambert_w_delta": teacher_lambert_w_delta,
                 "warm_started_params": warm_copied,
                 "kind": "consistency",
                 "model_state_kind": "ema",
@@ -496,6 +503,7 @@ def train_consistency_distill(
                 extra={
                     "train_loss": train_loss, "val_loss": val_loss,
                     "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
+                    "lambert_w_delta": teacher_lambert_w_delta,
                     "warm_started_params": warm_copied,
                     "kind": "consistency",
                     "model_state_kind": "ema",

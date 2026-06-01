@@ -412,9 +412,14 @@ def train_mean_flow_distill(
         )
     num_actions = int(teacher_ckpt.get("num_actions", load_num_actions(data_dir)))
     normalization = teacher_ckpt.get("normalization") or load_normalization(data_dir)
+    teacher_extra = teacher_ckpt.get("extra", {})
+    teacher_lambert_w_delta = float(teacher_extra.get("lambert_w_delta", 0.0) or 0.0)
 
     if stage == "vol":
-        datasets = build_vol_datasets(data_dir, normalization, num_actions)
+        datasets = build_vol_datasets(
+            data_dir, normalization, num_actions,
+            lambert_w_delta=teacher_lambert_w_delta,
+        )
         expected_state = 1
         expected_cond = 1 + num_actions
     else:
@@ -471,6 +476,7 @@ def train_mean_flow_distill(
         "student_config": asdict(student_config),
         "distill_config": asdict(distill_config),
         "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
+        "teacher_lambert_w_delta": teacher_lambert_w_delta,
         "warm_started_params": warm_copied,
         "normalization": normalization,
         "data_dir": str(Path(data_dir).resolve()),
@@ -575,6 +581,7 @@ def train_mean_flow_distill(
                 "val_identity_loss": val_stats["identity_loss"],
                 "boundary_prob": boundary_prob,
                 "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
+                "lambert_w_delta": teacher_lambert_w_delta,
                 "warm_started_params": warm_copied,
                 "kind": "mean_flow",
             },
@@ -595,6 +602,7 @@ def train_mean_flow_distill(
                     "val_identity_loss": val_stats["identity_loss"],
                     "boundary_prob": boundary_prob,
                     "teacher_checkpoint": str(Path(distill_config.teacher_checkpoint).resolve()),
+                    "lambert_w_delta": teacher_lambert_w_delta,
                     "warm_started_params": warm_copied,
                     "kind": "mean_flow",
                 },
