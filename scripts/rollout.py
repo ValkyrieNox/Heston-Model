@@ -48,33 +48,8 @@ def parse_args() -> argparse.Namespace:
                         help="ODE steps when a checkpoint is an FM teacher")
     parser.add_argument("--cfg-w", type=float, default=0.0,
                         help="classifier-free guidance weight over action conditioning")
-    parser.add_argument("--calibrate-moments", action="store_true",
-                        help="affine-calibrate pooled generated log-returns to the data's "
-                             "return_mean/return_std at sampling time (same correction the "
-                             "Quant GAN baseline uses), then rebuild price paths. Default off.")
-    parser.add_argument("--calibration-eps", type=float, default=1e-6)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
-
-
-def _calibrate_returns(r_paths, initial_s, return_mean, return_std, eps):
-    """Pin pooled return mean/std to the data's, then rebuild S from returns.
-
-    Mirrors finflow.baselines.quant_gan.calibrate_standardized_moments so the
-    flow models receive exactly the same sampling-time moment correction as the
-    Quant GAN baseline (for a fair head-to-head). Only returns + prices change;
-    variance paths are untouched.
-    """
-    from finflow.baselines.quant_gan import calibrate_standardized_moments
-
-    standardized, info = calibrate_standardized_moments(r_paths.reshape(-1), eps=eps)
-    r_cal = standardized.reshape(r_paths.shape).astype(np.float64) * return_std + return_mean
-    cum = np.cumsum(r_cal, axis=1)
-    s_tail = float(initial_s) * np.exp(cum)
-    s0_col = np.full((s_tail.shape[0], 1), float(initial_s), dtype=s_tail.dtype)
-    s_paths = np.concatenate([s0_col, s_tail], axis=1)
-    info.update({"return_mean": float(return_mean), "return_std": float(return_std)})
-    return r_cal.astype(np.float32), s_paths.astype(np.float32), info
 
 
 def main() -> None:
@@ -131,24 +106,13 @@ def main() -> None:
         cfg_w=args.cfg_w,
     )
 
-    r_paths = result.r_paths
-    s_paths = result.s_paths
-    calibration_info: dict | None = None
-    if args.calibrate_moments:
-        r_paths, s_paths, calibration_info = _calibrate_returns(
-            result.r_paths, result.initial_s,
-            return_mean=float(normalization["return_mean"]),
-            return_std=float(normalization["return_std"]),
-            eps=args.calibration_eps,
-        )
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         args.output,
         log_v_paths=result.log_v_paths,
         v_paths=result.v_paths,
-        r_paths=r_paths,
-        s_paths=s_paths,
+        r_paths=result.r_paths,
+        s_paths=result.s_paths,
         actions=result.actions,
     )
     info = {
@@ -166,8 +130,6 @@ def main() -> None:
         "regime_actions": bool(args.regime_actions and num_actions > 1),
         "constant_action": bool(args.constant_action),
         "cfg_w": args.cfg_w,
-        "calibrate_moments": bool(args.calibrate_moments),
-        "calibration": calibration_info or {},
     }
     info_path = args.output.with_suffix(".json")
     info_path.write_text(json.dumps(info, indent=2), encoding="utf-8")

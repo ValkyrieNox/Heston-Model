@@ -34,12 +34,6 @@ Options:
   --cd-epochs INT                  default: 10
   --qgan-epochs INT                default: 15
   --lr FLOAT                       default: 3e-4
-  --lr-schedule MODE               constant|cosine, default: constant
-  --lr-min FLOAT                   eta_min for cosine, default: 0.0
-  --hidden-dim INT                 FM teacher width, default: 128
-  --num-blocks INT                 FM teacher depth, default: 4
-  --cache-data-device              preload vectorized condition/target tensors onto DEVICE
-  --save-every-epochs INT          dump epoch_XXX.pt every N (0=off), default: 0
   --action-dropout-prob FLOAT      default: 0.1
   --ret-scheduled-max-prob FLOAT   default: 0.5
   --ret-scheduled-start-epoch INT  default: 1
@@ -88,13 +82,6 @@ MF_EPOCHS="10"
 CD_EPOCHS="10"
 QGAN_EPOCHS="15"
 LR="3e-4"
-LR_SCHEDULE="constant"
-LR_MIN="0.0"
-HIDDEN_DIM="128"
-NUM_BLOCKS="4"
-CACHE_DATA_DEVICE="0"
-SAVE_EVERY_EPOCHS="0"
-VOL_LAMBERT_W_DELTA="0.0"
 ACTION_DROPOUT_PROB="0.1"
 RET_SCHEDULED_MAX_PROB="0.5"
 RET_SCHEDULED_START_EPOCH="1"
@@ -122,14 +109,6 @@ while [[ $# -gt 0 ]]; do
     --cd-epochs) CD_EPOCHS="$2"; shift 2 ;;
     --qgan-epochs) QGAN_EPOCHS="$2"; shift 2 ;;
     --lr) LR="$2"; shift 2 ;;
-    --lr-schedule) LR_SCHEDULE="$2"; shift 2 ;;
-    --lr-min) LR_MIN="$2"; shift 2 ;;
-    --hidden-dim) HIDDEN_DIM="$2"; shift 2 ;;
-    --num-blocks) NUM_BLOCKS="$2"; shift 2 ;;
-    --cache-data-device) CACHE_DATA_DEVICE="1"; shift ;;
-    --no-cache-data-device) CACHE_DATA_DEVICE="0"; shift ;;
-    --save-every-epochs) SAVE_EVERY_EPOCHS="$2"; shift 2 ;;
-    --vol-lambert-w-delta) VOL_LAMBERT_W_DELTA="$2"; shift 2 ;;
     --action-dropout-prob) ACTION_DROPOUT_PROB="$2"; shift 2 ;;
     --ret-scheduled-max-prob) RET_SCHEDULED_MAX_PROB="$2"; shift 2 ;;
     --ret-scheduled-start-epoch) RET_SCHEDULED_START_EPOCH="$2"; shift 2 ;;
@@ -148,10 +127,6 @@ TAG="${TAG:-$EXPERIMENT_NAME}"
 TRAIN_DIR="$RUN_DIR/training"
 META_DIR="$RUN_DIR/metadata"
 LOG_DIR="$META_DIR/logs/train"
-CACHE_DATA_ARGS=()
-if [[ "$CACHE_DATA_DEVICE" == "1" ]]; then
-  CACHE_DATA_ARGS=(--cache-data-device)
-fi
 
 VOL_RUN="vol_${TAG}"
 RET_RUN="ret_${TAG}"
@@ -199,13 +174,6 @@ config = {
     "cd_epochs": int("$CD_EPOCHS"),
     "qgan_epochs": int("$QGAN_EPOCHS"),
     "lr": "$LR",
-    "lr_schedule": "$LR_SCHEDULE",
-    "lr_min": "$LR_MIN",
-    "hidden_dim": int("$HIDDEN_DIM"),
-    "num_blocks": int("$NUM_BLOCKS"),
-    "cache_data_device": bool(int("$CACHE_DATA_DEVICE")),
-    "save_every_epochs": int("$SAVE_EVERY_EPOCHS"),
-    "vol_lambert_w_delta": "$VOL_LAMBERT_W_DELTA",
     "action_dropout_prob": "$ACTION_DROPOUT_PROB",
     "ret_scheduled_max_prob": "$RET_SCHEDULED_MAX_PROB",
     "ret_scheduled_start_epoch": int("$RET_SCHEDULED_START_EPOCH"),
@@ -314,13 +282,6 @@ run_if_missing vol_fm "$TRAIN_DIR/vol_fm/$VOL_RUN/checkpoints/best.pt" \
     --batch-size "$BATCH_SIZE" \
     --epochs "$FM_EPOCHS" \
     --lr "$LR" \
-    --lr-schedule "$LR_SCHEDULE" \
-    --lr-min "$LR_MIN" \
-    --hidden-dim "$HIDDEN_DIM" \
-    --num-blocks "$NUM_BLOCKS" \
-    "${CACHE_DATA_ARGS[@]}" \
-    --save-every-epochs "$SAVE_EVERY_EPOCHS" \
-    --lambert-w-delta "$VOL_LAMBERT_W_DELTA" \
     --action-dropout-prob "$ACTION_DROPOUT_PROB" \
     --device "$DEVICE"
 
@@ -332,12 +293,6 @@ run_if_missing ret_fm "$TRAIN_DIR/ret_fm/$RET_RUN/checkpoints/best.pt" \
     --batch-size "$BATCH_SIZE" \
     --epochs "$FM_EPOCHS" \
     --lr "$LR" \
-    --lr-schedule "$LR_SCHEDULE" \
-    --lr-min "$LR_MIN" \
-    --hidden-dim "$HIDDEN_DIM" \
-    --num-blocks "$NUM_BLOCKS" \
-    "${CACHE_DATA_ARGS[@]}" \
-    --save-every-epochs "$SAVE_EVERY_EPOCHS" \
     --action-dropout-prob "$ACTION_DROPOUT_PROB" \
     --vol-sampler-checkpoint "$TRAIN_DIR/vol_fm/$VOL_RUN/checkpoints/best.pt" \
     --scheduled-sampling-max-prob "$RET_SCHEDULED_MAX_PROB" \
@@ -353,7 +308,6 @@ run_if_missing mf_vol "$TRAIN_DIR/mf_vol/$MF_VOL_RUN/checkpoints/best.pt" \
     --run-name "$MF_VOL_RUN" \
     --epochs "$MF_EPOCHS" \
     --batch-size "$BATCH_SIZE" \
-    "${CACHE_DATA_ARGS[@]}" \
     --boundary-prob-start 0.5 \
     --boundary-prob-end 0.1 \
     --identity-residual-eval \
@@ -368,7 +322,6 @@ run_if_missing mf_ret "$TRAIN_DIR/mf_ret/$MF_RET_RUN/checkpoints/best.pt" \
     --run-name "$MF_RET_RUN" \
     --epochs "$MF_EPOCHS" \
     --batch-size "$BATCH_SIZE" \
-    "${CACHE_DATA_ARGS[@]}" \
     --boundary-prob-start 0.5 \
     --boundary-prob-end 0.1 \
     --identity-residual-eval \
@@ -383,7 +336,6 @@ run_if_missing cd_vol "$TRAIN_DIR/cd_vol/$CD_VOL_RUN/checkpoints/best.pt" \
     --run-name "$CD_VOL_RUN" \
     --epochs "$CD_EPOCHS" \
     --batch-size "$BATCH_SIZE" \
-    "${CACHE_DATA_ARGS[@]}" \
     --curriculum-kind ict \
     --n-min 10 \
     --n-max 160 \
@@ -399,7 +351,6 @@ run_if_missing cd_ret "$TRAIN_DIR/cd_ret/$CD_RET_RUN/checkpoints/best.pt" \
     --run-name "$CD_RET_RUN" \
     --epochs "$CD_EPOCHS" \
     --batch-size "$BATCH_SIZE" \
-    "${CACHE_DATA_ARGS[@]}" \
     --curriculum-kind ict \
     --n-min 10 \
     --n-max 160 \

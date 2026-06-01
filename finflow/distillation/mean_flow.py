@@ -42,8 +42,7 @@ from finflow.training import (
     _fmt_time,
     _iterate_batches,
     _make_progress,
-    TensorBatchLoader,
-    build_batch_loader,
+    build_dataloader,
     build_ret_datasets,
     build_run_dir,
     build_vol_datasets,
@@ -68,7 +67,6 @@ class MeanFlowDistillConfig:
     grad_clip_norm: float = 1.0
     time_eps: float = 1e-3
     num_workers: int = 0
-    cache_data_device: bool = False
     seed: int = 1234
     device: str = "auto"
     max_train_batches: int | None = None
@@ -278,7 +276,7 @@ def _boundary_prob_for_epoch(config: MeanFlowDistillConfig, epoch: int) -> float
 def _evaluate_mean_flow(
     student: MeanFlowStudent,
     teacher: TransitionFM,
-    loader: DataLoader | TensorBatchLoader,
+    loader: DataLoader,
     device: torch.device,
     *,
     time_eps: float,
@@ -329,7 +327,7 @@ def _evaluate_mean_flow(
 def _train_one_epoch_mean_flow(
     student: MeanFlowStudent,
     teacher: TransitionFM,
-    loader: DataLoader | TensorBatchLoader,
+    loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     *,
@@ -449,15 +447,13 @@ def train_mean_flow_distill(
         weight_decay=distill_config.weight_decay,
     )
 
-    train_loader = build_batch_loader(
+    train_loader = build_dataloader(
         datasets["train"], batch_size=distill_config.batch_size, shuffle=True,
         num_workers=distill_config.num_workers, device=device,
-        cache_on_device=distill_config.cache_data_device,
     )
-    val_loader = build_batch_loader(
+    val_loader = build_dataloader(
         datasets["val"], batch_size=distill_config.batch_size, shuffle=False,
         num_workers=distill_config.num_workers, device=device,
-        cache_on_device=distill_config.cache_data_device,
     )
 
     run_dir = build_run_dir(output_dir, run_name=run_name, prefix=f"mf_{stage}_distill")
@@ -484,7 +480,6 @@ def train_mean_flow_distill(
     if distill_config.progress:
         header = (
             f"[finflow] mf_distill stage={stage} | run={run_dir.name} | device={device} | "
-            f"cache_data_device={int(distill_config.cache_data_device)} | "
             f"params={n_params/1e3:.1f}k | warm_start={warm_copied} tensors | "
             f"train={len(datasets['train'])} ({train_batches} batch x {distill_config.batch_size}) | "
             f"val={len(datasets['val'])} ({val_batches} batch) | epochs={distill_config.epochs}"

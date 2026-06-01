@@ -34,8 +34,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--cache-data-device", action="store_true",
-                        help="preload vectorized condition/target tensors onto the training device")
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
 
@@ -83,7 +81,6 @@ def main() -> None:
         grad_clip_norm=args.grad_clip_norm,
         time_eps=args.time_eps,
         num_workers=args.num_workers,
-        cache_data_device=args.cache_data_device,
         seed=args.seed,
         device=args.device,
         max_train_batches=args.max_train_batches,

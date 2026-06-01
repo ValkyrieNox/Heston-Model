@@ -28,36 +28,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-actions", type=int, default=None,
                         help="Override action dim; default auto-detected from metadata.")
 
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--time-eps", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--cache-data-device", action="store_true",
-                        help="preload vectorized condition/target tensors onto the training device")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-val-batches", type=int, default=None)
     parser.add_argument("--action-dropout-prob", type=float, default=0.1,
                         help="drop action one-hot during training for CFG support")
-    parser.add_argument("--save-every-epochs", type=int, default=0,
-                        help=">0: also dump checkpoints/epoch_XXX.pt every N epochs "
-                             "(for pricing-aware checkpoint selection)")
-    parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
-    parser.add_argument("--lr-min", type=float, default=0.0,
-                        help="eta_min for cosine schedule")
-    parser.add_argument("--lambert-w-delta", type=float, default=0.0,
-                        help="Lambert-W Gaussianize the log-variance target (heavy-tail "
-                             "trick from Quant GAN, applied to the variance kernel). "
-                             "Typical 0.05-0.2; 0 = off. Stored in checkpoint for sampling.")
+    parser.add_argument("--cache-data-device", action="store_true",
+                        help="preload condition/target tensors onto GPU (huge speedup)")
+    parser.add_argument("--use-amp", action="store_true",
+                        help="use automatic mixed precision (FP16/BF16) for forward/backward")
 
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--time-embedding-dim", type=int, default=64)
-    parser.add_argument("--num-blocks", type=int, default=4)
+    parser.add_argument("--num-blocks", type=int, default=6)
     return parser.parse_args()
 
 
@@ -81,16 +73,14 @@ def main() -> None:
         grad_clip_norm=args.grad_clip_norm,
         time_eps=args.time_eps,
         num_workers=args.num_workers,
-        cache_data_device=args.cache_data_device,
         seed=args.seed,
         device=args.device,
         log_every=args.log_every,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
         action_dropout_prob=args.action_dropout_prob,
-        save_every_epochs=args.save_every_epochs,
-        lr_schedule=args.lr_schedule,
-        lr_min=args.lr_min,
+        cache_data_device=args.cache_data_device,
+        use_amp=args.use_amp,
     )
     summary = train_vol_trans_fm(
         data_dir=args.data_dir,
@@ -99,7 +89,6 @@ def main() -> None:
         num_actions=num_actions,
         model_config=model_config,
         train_config=train_config,
-        lambert_w_delta=args.lambert_w_delta,
     )
     print(json.dumps(summary, indent=2))
 

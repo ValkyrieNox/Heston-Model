@@ -17,13 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from torch import nn
 
 from finflow.models import ConsistencyStudent, MeanFlowStudent, TransitionFM
 from finflow.training import load_checkpoint, resolve_device
-from finflow.transforms import inverse_lambert_w_transform
 
 
 class Sampler:
@@ -196,38 +194,6 @@ class ConsistencySampler(Sampler):
         return out
 
 
-class LambertWInverseSampler(Sampler):
-    """Wrap a sampler trained on a Lambert-W Gaussianized target.
-
-    The wrapped model emits samples in the Gaussianized domain; we map them
-    back to the standardized target domain with the inverse Lambert-W transform
-    so the rest of the rollout (denormalization, exp -> variance) is unchanged.
-    """
-
-    def __init__(self, base: Sampler, delta: float) -> None:
-        if delta <= 0.0:
-            raise ValueError("delta must be positive to wrap a sampler")
-        self._base = base
-        self.delta = float(delta)
-        self.state_dim = base.state_dim
-        self.condition_dim = base.condition_dim
-        self.kind = base.kind
-        self.device = base.device
-        self.num_actions = base.num_actions
-
-    def sample(
-        self,
-        condition: torch.Tensor,
-        *,
-        noise: torch.Tensor | None = None,
-        cfg_w: float = 0.0,
-    ) -> torch.Tensor:
-        gaussianized = self._base.sample(condition, noise=noise, cfg_w=cfg_w)
-        arr = gaussianized.detach().cpu().numpy()
-        restored = inverse_lambert_w_transform(arr, delta=self.delta)
-        return torch.as_tensor(restored, dtype=gaussianized.dtype, device=gaussianized.device)
-
-
 @dataclass
 class LoadedSampler:
     sampler: Sampler
@@ -310,13 +276,6 @@ def load_sampler_from_checkpoint(
         sampler = FMTeacherSampler(model, n_steps=fm_n_steps, num_actions=num_actions)
     else:
         raise ValueError(f"unknown sampler kind '{kind}'")
-
-    # Vol kernels trained with Lambert-W Gaussianized targets emit samples in
-    # the Gaussianized domain; wrap so the inverse transform is applied before
-    # the rollout denormalizes. Stored under extra.lambert_w_delta (0 = off).
-    lambert_w_delta = float(extra.get("lambert_w_delta", 0.0) or 0.0)
-    if lambert_w_delta > 0.0:
-        sampler = LambertWInverseSampler(sampler, delta=lambert_w_delta)
 
     return LoadedSampler(
         sampler=sampler,
