@@ -384,7 +384,9 @@ def train_pathwise_teacher_finetune(
     ).to(device)
     vol_forward = _maybe_compile_model(vol_model, enabled=config.compile_models, mode=config.compile_mode)
     ret_forward = _maybe_compile_model(ret_model, enabled=config.compile_models, mode=config.compile_mode)
-    critic_forward = _maybe_compile_model(critic, enabled=config.compile_models, mode=config.compile_mode)
+    # Keep the WGAN-GP critic in eager mode: the gradient penalty uses double
+    # backward, which is not supported by AOTAutograd in all PyTorch builds.
+    critic_forward = critic
 
     teacher_params = [p for p in list(vol_model.parameters()) + list(ret_model.parameters()) if p.requires_grad]
     teacher_optimizer = torch.optim.AdamW(teacher_params, lr=config.lr_teacher)
