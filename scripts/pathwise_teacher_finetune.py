@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--compile-models", action="store_true",
-                        help="use torch.compile on the FM teachers and path critic")
+                        help="use torch.compile on the FM teachers")
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
     return parser.parse_args()
 
