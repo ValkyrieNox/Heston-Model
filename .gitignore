@@ -33,3 +33,13 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.out
+
+# Large bundled archives (local-only; extracted contents are committed where small)
+*.tar
+*.tgz

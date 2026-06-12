@@ -1,26 +1,40 @@
 # 仓库地图(REPO_MAP)
 
-本仓库 = 924 GPU 机 `/root/autodl-tmp/Heston-Model` 的完整重建(2026-06-12),代码、git 历史、实验结果、未提交改动全部保留。本文件仅本地可见(已加入 `.git/info/exclude`,不影响 git 状态)。
+FinFlow — 基于流匹配的 Heston 世界模型:两阶段 FM teacher + 严格 proper 路径损失微调(sig-MMD / Sig-W1 / Energy,本项目方法)+ 少步蒸馏(CD / Lagrangian flow-map),与 GARCH-t / block-bootstrap / QGAN / DDPM 基线全面对比。
+
+本仓库 = 完整项目工作区(2026-06-12 由 924 GPU 机完整镜像重建):代码 + git 历史 + 实验结果 + 论文 + 分析管线 + 汇报材料。**大型二进制(数据集 npz、训练 checkpoint、tar 包)被 .gitignore 排除,仅存在于本地工作区与本地 archive 备份中;GitHub 上是代码、文档、图表与全部评测 JSON。**
 
 ## 目录
 
-| 路径 | 说明 |
-|---|---|
-| `finflow/` | 核心库:`models/`(TransitionFM、Consistency/MeanFlow student)、`training.py`、`distillation/`(CD、MeanFlow)、`eval/`(stylized facts、pricing、distances、signatures、reports)、`inference/`(rollout、samplers)、`data/`(Heston QE、期权定价、dataset)、`baselines/`(QuantGAN)、`pathwise_teacher.py`、`transforms.py` |
-| `scripts/` | CLI 入口:`train_vol_trans.py`/`train_ret_trans.py`(两阶段 teacher)、`pathwise_teacher_*.py`(路径损失微调,combined=本项目方法)、`distill_consistency/mean_flow/flow_map.py`(蒸馏;flow_map=Lagrangian)、`rollout.py`/`rollout_fewstep.py`(自由滚动/少步)、`evaluate_rollout.py`、各 `run_*.sh` |
-| `tests/` | pytest 单元测试(~86 个) |
-| `idea/` | 设计文档:`1/`(选题、文献、方法设计)、`2/`(完整计划、V3 实现、P0–P2 结果) |
-| `data/` | 数据集(688M,gitignored):三状态 Markov Heston(seed 20260530),与 `runs/experiments/p3_full_parallel/data/` 同源 |
-| `runs/` | **全部实验结果(17G,gitignored)— 索引见 `runs/README.md`** |
-| `logs/` | 4 个训练日志(原服务器仓库根的 p3_*.log,整理时移入) |
-| `_924_uncommitted/` | p3-tuning 分支当时的未提交状态存档(10 修改+3 未跟踪+patch),见其 README |
-| 根级文档 | `README.md`(项目说明)、`REPRODUCE.md`(全管线复现命令)、`RESULTS_SUMMARY.md`(结果总表)、`eval_extreme.json`、`new_teacher_distill_summary.md`(E06 独有结果摘要,未入提交) |
+| 路径 | 说明 | GitHub 上 |
+|---|---|---|
+| `finflow/` | 核心库:`models/`(TransitionFM、CD/MeanFlow student)、`training.py`、`distillation/`、`eval/`(stylized facts、pricing、distances、signatures)、`inference/`(rollout、samplers)、`data/`(Heston QE、期权定价)、`baselines/`(QuantGAN)、`pathwise_teacher.py` | ✓ |
+| `scripts/` | CLI 入口:两阶段 teacher 训练、`pathwise_teacher_*.py`(combined=本方法)、蒸馏(consistency/mean_flow/flow_map)、rollout(+fewstep)、评测、各 run_*.sh | ✓ |
+| `tests/` | pytest 单元测试 | ✓ |
+| `idea/` | 设计文档(选题、文献、方法设计、V3 实现、P0–P2 结果) | ✓ |
+| `paper/` | 论文:`main.tex`(英)/`main_zh.tex`(中,XeLaTeX)+ references.bib + 成品 PDF | ✓ |
+| `analysis/` | 图表管线:`make_figures.py` + `figures/`(fig1–9)+ `eval_json_backup/`(约 200 个评测 JSON,论文数字全部可复算)+ `viz_data/`、`p3_full_parallel_data/`(npz 本地) | ✓(npz/tar 除外) |
+| `presentation/` | 课程 PPT + 课程汇报演讲稿(.md/.pdf) | ✓ |
+| `server_artifacts/` | 924 服务器仓库外工件:`root_scripts/`(运行脚本+REPRODUCE 副本)、`vizdl/`、`partner/`(单 Heston 评测) | ✓(脚本/JSON;npz/log 本地) |
+| `data/` | 数据集 688M(三状态 Markov Heston,seed 20260530) | ✗ 本地 |
+| `runs/` | **全部实验结果 17G — 索引见 `runs/README.md`(索引本身已提交)** | ✗ 本地(仅索引) |
+| `logs/` | 4 个训练日志 | ✗ 本地 |
+| `_924_uncommitted/` | 924 机 p3-tuning 分支当时未提交状态的存档(10 修改+3 未跟踪+patch),见其 README | ✓ |
+| 根级文档 | `README.md`、`REPRODUCE.md`(复现命令)、`RESULTS_SUMMARY.md`(结果总表)、`eval_extreme.json`、`new_teacher_distill_summary.md` | ✓ |
 
-## git 状态说明
+## 数据与结果的本地权威副本
 
-- **当前检出**:`consolidated-all-code`(`eab4c5f`)= 最新代码超集(Lagrangian flow-map、few-step 采样、combined 训练器都在此分支)
-- **分支**:`p3-tuning-20260530`(924 当时检出,48a4b6c)、`0531-experiments-20260602`(含**未推送 commit `a6a4861`**:signature-kernel 路径损失——GitHub 上没有,推送前勿删本仓库)、`main`;远端 = github.com/ValkyrieNox/Heston-Model
-- **工作区(有意保留,勿"清理")**:
-  - `M scripts/distill_flow_map.py`:924 权威 worktree 上未提交的新版(改动前备份 = 旁边的 `.bak_20260603_negwarm`)
-  - `?? new_teacher_distill_summary.md`、`?? _924_uncommitted/`:保全内容,可择机提交
-- **本地配置**:`core.autocrlf=false`、`core.filemode=false`(Windows 必需,否则全仓库假"已修改");`finflow/**/__pycache__` 的 24 个 .pyc 是服务器上误提交进 git 的,保留勿删(删除会弄脏状态)
+- 本地工作区:`runs/`(17G)、`data/`(688M)、analysis 与 server_artifacts 中的 npz
+- 最终保险:`../archive/924机_backup/`(924 机逐字节镜像,17.8G,**不在 git 中**)
+- 数据可再生:`scripts/generate_heston_data.py --regimes --seed 20260530` + `generate_mc_oracle.py`
+
+## git 说明
+
+- `main` = 最新完整状态(由 `consolidated-all-code` 快进而来,并已合并 `0531-experiments-20260602` 的 signature-kernel 提交 a6a4861)
+- 历史分支:`p3-tuning-20260530`(实验期检出)、`0531-experiments-20260602`、`consolidated-all-code`
+- 本地配置:`core.autocrlf=false`、`core.filemode=false`(Windows 必需);`finflow/**/__pycache__` 的 .pyc 为历史误提交,保留
+
+## 关键结果速查(raw / cal / kurt;协议见 REPRODUCE.md,定价下限 0.165)
+
+- FM teacher:raw **0.475**(最佳)/ 0.583 / 3.88;combined 微调:cal **0.232**;combined-CD 蒸馏:cal **0.170**(≈下限);FM-CD:kurt **4.48**(最佳形状);B1(sched0.8):0.872/0.348/4.41(最佳平衡)
+- 系统性发现:raw ↔ cal/kurt 折中,无单一全胜模型
