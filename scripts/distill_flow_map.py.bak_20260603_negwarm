@@ -85,8 +85,6 @@ def parse_args():
     p.add_argument("--max-val-batches", type=int, default=None)
     p.add_argument("--cache-data-device", action="store_true")
     p.add_argument("--no-warm-start", action="store_true")
-    p.add_argument("--negate-warm-start", action="store_true",
-                   help="after copying FM weights, negate the final output layer so G starts near -v_teacher")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
@@ -119,13 +117,6 @@ def main():
     )
     student = MeanFlowStudent(**asdict(student_config)).to(device)
     warm = 0 if a.no_warm_start else warm_start_mean_flow_from_fm(student, teacher)
-    if a.negate_warm_start and warm > 0:
-        for module in reversed(student.output):
-            if isinstance(module, torch.nn.Linear):
-                module.weight.data.mul_(-1.0)
-                if module.bias is not None:
-                    module.bias.data.mul_(-1.0)
-                break
     opt = torch.optim.AdamW(student.parameters(), lr=a.lr, weight_decay=a.weight_decay)
 
     train_loader = build_batch_loader(datasets["train"], batch_size=a.batch_size, shuffle=True,
@@ -138,7 +129,7 @@ def main():
         "stage": a.stage, "teacher_checkpoint": str(a.teacher_checkpoint), "method": "lagrangian_flowmap",
         "student_config": asdict(student_config), "lambert_w_delta": delta, "warm": warm,
         "epochs": a.epochs, "batch_size": a.batch_size, "lr": a.lr, "boundary_prob": a.boundary_prob,
-        "max_train_batches": a.max_train_batches, "negate_warm_start": a.negate_warm_start}, indent=2), encoding="utf-8")
+        "max_train_batches": a.max_train_batches}, indent=2), encoding="utf-8")
     n_params = sum(p.numel() for p in student.parameters())
     print(f"[flowmap] stage={a.stage} run={run_dir.name} params={n_params/1e3:.1f}k warm={warm} "
           f"cache={int(a.cache_data_device)} delta={delta} epochs={a.epochs}", flush=True)
