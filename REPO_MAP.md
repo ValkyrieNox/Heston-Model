@@ -19,7 +19,6 @@ FinFlow — 基于流匹配的 Heston 世界模型:两阶段 FM teacher + 严格
 | `data/` | 数据集 688M(三状态 Markov Heston,seed 20260530) | ✗ 本地 |
 | `runs/` | **全部实验结果 17G — 索引见 `runs/README.md`(索引本身已提交)** | ✗ 本地(仅索引) |
 | `logs/` | 4 个训练日志 | ✗ 本地 |
-| `_924_uncommitted/` | 924 机 p3-tuning 分支当时未提交状态的存档(10 修改+3 未跟踪+patch),见其 README | ✓ |
 | 根级文档 | `README.md`、`REPRODUCE.md`(复现命令)、`RESULTS_SUMMARY.md`(结果总表)、`eval_extreme.json`、`new_teacher_distill_summary.md` | ✓ |
 
 ## 数据与结果的本地权威副本
@@ -31,7 +30,7 @@ FinFlow — 基于流匹配的 Heston 世界模型:两阶段 FM teacher + 严格
 ## git 说明
 
 - `main` = 最新完整状态(由 `consolidated-all-code` 快进而来,并已合并 `0531-experiments-20260602` 的 signature-kernel 提交 a6a4861)
-- 历史分支:`p3-tuning-20260530`(实验期检出)、`0531-experiments-20260602`、`consolidated-all-code`
+- 历史分支:`p3-tuning-20260530`(实验期检出;其 tip `3ecf135` = 924 机关机时的未提交实验状态,逐文件 SHA256 核对后正式入库,GitHub 分支名 `p3-tuning-20260530-924state`)、`0531-experiments-20260602`、`consolidated-all-code`
 - 本地配置:`core.autocrlf=false`、`core.filemode=false`(Windows 必需);`finflow/**/__pycache__` 的 .pyc 为历史误提交,保留
 
 ## 关键结果速查(raw / cal / kurt;协议见 REPRODUCE.md,定价下限 0.165)
