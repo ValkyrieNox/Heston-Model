@@ -75,6 +75,7 @@ class TransitionFMTrainConfig:
     grad_clip_norm: float = 1.0
     time_eps: float = 1e-4
     num_workers: int = 0
+    cache_data_device: bool = False
     seed: int = 1234
     device: str = "auto"
     log_every: int = 50
@@ -134,13 +135,106 @@ def load_num_actions(data_dir: str | Path) -> int:
     return int(metadata.get("num_actions", 1))
 
 
+class TensorBatchLoader:
+    """Minimal batch loader over prebuilt condition/target tensors.
+
+    This is intended for very small per-sample tabular tensors where PyTorch's
+    map-style DataLoader spends most of its time constructing Python objects.
+    """
+
+    def __init__(
+        self,
+        condition: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        device: torch.device,
+        action_start: int | None = None,
+        action_dropout_prob: float = 0.0,
+    ) -> None:
+        if condition.shape[0] != target.shape[0]:
+            raise ValueError("condition and target must have the same length")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.condition = condition.to(device, non_blocking=True).contiguous()
+        self.target = target.to(device, non_blocking=True).contiguous()
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.device = device
+        self.action_start = action_start
+        self.action_dropout_prob = float(action_dropout_prob)
+
+    def __len__(self) -> int:
+        n = int(self.condition.shape[0])
+        return (n + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        n = int(self.condition.shape[0])
+        if self.shuffle:
+            order = torch.randperm(n, device=self.device)
+            for start in range(0, n, self.batch_size):
+                idx = order[start:start + self.batch_size]
+                condition = self.condition.index_select(0, idx)
+                target = self.target.index_select(0, idx)
+                yield self._make_batch(condition, target)
+        else:
+            for start in range(0, n, self.batch_size):
+                end = min(start + self.batch_size, n)
+                yield self._make_batch(self.condition[start:end], self.target[start:end])
+
+    def _make_batch(self, condition: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.action_start is not None and self.action_dropout_prob > 0.0:
+            condition = condition.clone()
+            keep = (
+                torch.rand(condition.shape[0], 1, device=condition.device)
+                >= self.action_dropout_prob
+            ).to(dtype=condition.dtype)
+            condition[:, self.action_start:] *= keep
+        return {"condition": condition, "target": target}
+
+
 def build_dataloader(
     dataset: Dataset,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
     device: torch.device,
-) -> DataLoader:
+) -> DataLoader | TensorBatchLoader:
+    return build_batch_loader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        device=device,
+        cache_on_device=False,
+    )
+
+
+def build_batch_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    device: torch.device,
+    cache_on_device: bool,
+) -> DataLoader | TensorBatchLoader:
+    if cache_on_device:
+        if not hasattr(dataset, "as_condition_target_tensors"):
+            raise TypeError(
+                f"{type(dataset).__name__} does not support cache_data_device"
+            )
+        tensors = dataset.as_condition_target_tensors()
+        return TensorBatchLoader(
+            tensors["condition"],
+            tensors["target"],
+            batch_size=batch_size,
+            shuffle=shuffle,
+            device=device,
+            action_start=tensors.get("action_start"),
+            action_dropout_prob=float(tensors.get("action_dropout_prob", 0.0)),
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -191,7 +285,7 @@ def _make_progress(
 
 def evaluate_model(
     model: TransitionFM,
-    loader: DataLoader,
+    loader: DataLoader | TensorBatchLoader,
     device: torch.device,
     time_eps: float,
     max_batches: int | None = None,
@@ -226,7 +320,7 @@ def evaluate_model(
 
 def train_one_epoch(
     model: TransitionFM,
-    loader: DataLoader,
+    loader: DataLoader | TensorBatchLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     time_eps: float,
@@ -347,13 +441,15 @@ def _run_fm_training(
             optimizer, T_max=max(train_config.epochs, 1), eta_min=train_config.lr_min,
         )
 
-    train_loader = build_dataloader(
+    train_loader = build_batch_loader(
         datasets["train"], batch_size=train_config.batch_size, shuffle=True,
         num_workers=train_config.num_workers, device=device,
+        cache_on_device=train_config.cache_data_device,
     )
-    val_loader = build_dataloader(
+    val_loader = build_batch_loader(
         datasets["val"], batch_size=train_config.batch_size, shuffle=False,
         num_workers=train_config.num_workers, device=device,
+        cache_on_device=train_config.cache_data_device,
     )
 
     config_blob = {
@@ -383,6 +479,7 @@ def _run_fm_training(
     if train_config.progress:
         header = (
             f"[finflow] stage={stage} | run={run_dir.name} | device={device} | "
+            f"cache_data_device={int(train_config.cache_data_device)} | "
             f"params={n_params/1e3:.1f}k | train={len(datasets['train'])} samples "
             f"({train_batches} batch/epoch x {train_config.batch_size}) | "
             f"val={len(datasets['val'])} samples ({val_batches} batch) | epochs={train_config.epochs}"

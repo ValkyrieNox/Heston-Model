@@ -73,6 +73,40 @@ class HestonTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "r_next": target[1],
         }
 
+    def as_condition_target_tensors(self) -> dict[str, object]:
+        """Return vectorized tensors for fast whole-dataset GPU caching."""
+
+        log_v_t = self.arrays["log_v_t"].astype(np.float32, copy=False)
+        r_t = self.arrays["r_t"].astype(np.float32, copy=False)
+        log_v_next = self.arrays["log_v_next"].astype(np.float32, copy=False)
+        r_next = self.arrays["r_next"].astype(np.float32, copy=False)
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+            r_t = (r_t - self.return_mean) / self.return_std
+            r_next = (r_next - self.return_mean) / self.return_std
+
+        condition = np.stack(
+            [
+                np.asarray(log_v_t, dtype=np.float32),
+                np.asarray(r_t, dtype=np.float32),
+            ],
+            axis=1,
+        )
+        target = np.stack(
+            [
+                np.asarray(log_v_next, dtype=np.float32),
+                np.asarray(r_next, dtype=np.float32),
+            ],
+            axis=1,
+        )
+        return {
+            "condition": torch.from_numpy(np.ascontiguousarray(condition)),
+            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "action_start": None,
+            "action_dropout_prob": 0.0,
+        }
+
 
 def _load_action_array(npz_files: list[str], npz: np.lib.npyio.NpzFile, n: int) -> np.ndarray:
     if "action" in npz_files:
@@ -101,6 +135,15 @@ def _maybe_drop_action(action_onehot: torch.Tensor, prob: float) -> torch.Tensor
     if torch.rand(()) < prob:
         return torch.zeros_like(action_onehot)
     return action_onehot
+
+
+def _one_hot_matrix(actions: np.ndarray, dim: int) -> np.ndarray:
+    actions = np.asarray(actions, dtype=np.int64)
+    if np.any((actions < 0) | (actions >= dim)):
+        raise IndexError(f"action index out of range [0, {dim})")
+    out = np.zeros((actions.shape[0], dim), dtype=np.float32)
+    out[np.arange(actions.shape[0]), actions] = 1.0
+    return out
 
 
 class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
@@ -169,6 +212,30 @@ class HestonVolTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "log_v_t": torch.tensor(log_v_t, dtype=torch.float32),
             "log_v_next": target[0],
             "action": torch.tensor(action, dtype=torch.long),
+        }
+
+    def as_condition_target_tensors(self) -> dict[str, object]:
+        """Return vectorized tensors for fast whole-dataset GPU caching."""
+
+        log_v_t = self.log_v_t.astype(np.float32, copy=False)
+        log_v_next = self.log_v_next.astype(np.float32, copy=False)
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+
+        condition = np.concatenate(
+            [
+                np.asarray(log_v_t, dtype=np.float32).reshape(-1, 1),
+                _one_hot_matrix(self.action, self.num_actions),
+            ],
+            axis=1,
+        )
+        target = np.asarray(log_v_next, dtype=np.float32).reshape(-1, 1)
+        return {
+            "condition": torch.from_numpy(np.ascontiguousarray(condition)),
+            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "action_start": 1,
+            "action_dropout_prob": self.action_dropout_prob,
         }
 
 
@@ -256,4 +323,39 @@ class HestonRetTransitionDataset(Dataset[dict[str, torch.Tensor]]):
             "r_t": torch.tensor(r_t, dtype=torch.float32),
             "r_next": target[0],
             "action": torch.tensor(action, dtype=torch.long),
+        }
+
+    def as_condition_target_tensors(self) -> dict[str, object]:
+        """Return vectorized tensors for fast whole-dataset GPU caching."""
+
+        log_v_t = self.log_v_t.astype(np.float32, copy=False)
+        log_v_next = self.log_v_next.astype(np.float32, copy=False)
+        r_t = self.r_t.astype(np.float32, copy=False)
+        r_next = self.r_next.astype(np.float32, copy=False)
+        if self.normalize:
+            log_v_t = (log_v_t - self.log_v_mean) / self.log_v_std
+            log_v_next = (log_v_next - self.log_v_mean) / self.log_v_std
+            r_t = (r_t - self.return_mean) / self.return_std
+            r_next = (r_next - self.return_mean) / self.return_std
+
+        condition = np.concatenate(
+            [
+                np.stack(
+                    [
+                        np.asarray(log_v_next, dtype=np.float32),
+                        np.asarray(log_v_t, dtype=np.float32),
+                        np.asarray(r_t, dtype=np.float32),
+                    ],
+                    axis=1,
+                ),
+                _one_hot_matrix(self.action, self.num_actions),
+            ],
+            axis=1,
+        )
+        target = np.asarray(r_next, dtype=np.float32).reshape(-1, 1)
+        return {
+            "condition": torch.from_numpy(np.ascontiguousarray(condition)),
+            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "action_start": 3,
+            "action_dropout_prob": self.action_dropout_prob,
         }
