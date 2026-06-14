@@ -48,6 +48,22 @@ def test_conditional_flow_matching_loss_returns_scalar() -> None:
     assert torch.isfinite(loss)
 
 
+def test_conditional_flow_matching_loss_accepts_target_weights() -> None:
+    torch.manual_seed(1)
+    model = TransitionFM(hidden_dim=32, time_embedding_dim=16, num_blocks=2)
+    condition = torch.randn(8, 2)
+    target = torch.randn(8, 2)
+
+    loss = conditional_flow_matching_loss(
+        model, condition=condition, target=target,
+        target_weights=torch.tensor([1.0, 2.0]),
+    )
+    loss.backward()
+
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+
 def test_euler_sample_shape() -> None:
     torch.manual_seed(2)
     model = TransitionFM(hidden_dim=32, time_embedding_dim=16, num_blocks=2)

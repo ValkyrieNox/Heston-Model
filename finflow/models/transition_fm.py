@@ -162,6 +162,7 @@ def conditional_flow_matching_loss(
     condition: torch.Tensor,
     target: torch.Tensor,
     time_eps: float = 1e-4,
+    target_weights: torch.Tensor | None = None,
     reduction: Literal["mean", "none"] = "mean",
 ) -> torch.Tensor:
     """Compute conditional FM MSE loss for normalized transitions."""
@@ -169,6 +170,14 @@ def conditional_flow_matching_loss(
     x_tau, tau, velocity, _ = sample_conditional_flow_batch(target=target, time_eps=time_eps)
     prediction = model(x_tau=x_tau, tau=tau, condition=condition)
     per_dim_loss = (prediction - velocity).pow(2)
+    if target_weights is not None:
+        if target_weights.ndim != 1 or target_weights.shape[0] != target.shape[-1]:
+            raise ValueError("target_weights must have shape [target_dim]")
+        weights = target_weights.to(device=target.device, dtype=target.dtype)
+        if torch.any(weights <= 0):
+            raise ValueError("target_weights must be positive")
+        weights = weights / weights.mean().clamp_min(1e-12)
+        per_dim_loss = per_dim_loss * weights.view(*([1] * (per_dim_loss.ndim - 1)), -1)
     if reduction == "mean":
         return per_dim_loss.mean()
     if reduction == "none":

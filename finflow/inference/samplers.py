@@ -3,7 +3,7 @@
 Three concrete samplers share the same ``sample(condition, *, noise=None) -> Tensor``
 interface so the rollout module can plug any of them in:
 
-- ``FMTeacherSampler``: multi-step Euler integration of an FM teacher.
+- ``FMTeacherSampler``: multi-step ODE integration of an FM teacher.
 - ``MeanFlowSampler``:  single-NFE call to a Mean Flow student.
 - ``ConsistencySampler``: single-NFE call to a Consistency student.
 
@@ -74,24 +74,43 @@ def _unconditional_condition(
 
 
 class FMTeacherSampler(Sampler):
-    """Multi-step Euler ODE sampler over a trained Flow Matching teacher."""
+    """Multi-step ODE sampler over a trained Flow Matching teacher."""
 
     kind = "fm"
+    VALID_SOLVERS = {"euler", "heun"}
 
     def __init__(
         self,
         model: TransitionFM,
         n_steps: int = 20,
         num_actions: int | None = None,
+        solver: str = "euler",
     ) -> None:
         if n_steps <= 0:
             raise ValueError("n_steps must be positive")
+        if solver not in self.VALID_SOLVERS:
+            raise ValueError(f"solver must be one of {sorted(self.VALID_SOLVERS)}")
         self.model = model
         self.n_steps = n_steps
+        self.solver = solver
         self.state_dim = model.state_dim
         self.condition_dim = model.condition_dim
         self.device = next(model.parameters()).device
         self.num_actions = num_actions
+
+    def _velocity(
+        self,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        condition: torch.Tensor,
+        unconditional: torch.Tensor | None,
+        cfg_w: float,
+    ) -> torch.Tensor:
+        velocity = self.model(x_tau=x, tau=tau, condition=condition)
+        if unconditional is not None:
+            velocity_uncond = self.model(x_tau=x, tau=tau, condition=unconditional)
+            velocity = (1.0 + cfg_w) * velocity - cfg_w * velocity_uncond
+        return velocity
 
     @torch.no_grad()
     def sample(
@@ -109,11 +128,17 @@ class FMTeacherSampler(Sampler):
         dt = 1.0 / self.n_steps
         for step in range(self.n_steps):
             tau = torch.full((batch,), step * dt, device=self.device, dtype=dtype)
-            velocity = self.model(x_tau=x, tau=tau, condition=condition)
-            if unconditional is not None:
-                velocity_uncond = self.model(x_tau=x, tau=tau, condition=unconditional)
-                velocity = (1.0 + cfg_w) * velocity - cfg_w * velocity_uncond
-            x = x + dt * velocity
+            velocity = self._velocity(x, tau, condition, unconditional, cfg_w)
+            if self.solver == "euler":
+                x = x + dt * velocity
+                continue
+
+            tau_next = torch.full(
+                (batch,), min((step + 1) * dt, 1.0), device=self.device, dtype=dtype,
+            )
+            x_pred = x + dt * velocity
+            velocity_next = self._velocity(x_pred, tau_next, condition, unconditional, cfg_w)
+            x = x + 0.5 * dt * (velocity + velocity_next)
         return x
 
 
@@ -249,6 +274,7 @@ def load_sampler_from_checkpoint(
     *,
     kind_override: str | None = None,
     fm_n_steps: int = 20,
+    fm_solver: str = "euler",
     consistency_time_eps: float = 1e-3,
 ) -> LoadedSampler:
     """Load a sampler from a saved checkpoint, dispatching on its ``extra.kind``.
@@ -307,7 +333,9 @@ def load_sampler_from_checkpoint(
         )
         model.load_state_dict(ckpt["model_state"])
         model.to(resolved_device).eval()
-        sampler = FMTeacherSampler(model, n_steps=fm_n_steps, num_actions=num_actions)
+        sampler = FMTeacherSampler(
+            model, n_steps=fm_n_steps, num_actions=num_actions, solver=fm_solver,
+        )
     else:
         raise ValueError(f"unknown sampler kind '{kind}'")
 

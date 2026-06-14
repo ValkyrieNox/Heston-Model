@@ -203,3 +203,118 @@ def autoregressive_rollout(
         initial_s=float(initial_s),
         num_actions=num_actions,
     )
+
+
+def joint_autoregressive_rollout(
+    joint_sampler: Sampler,
+    *,
+    normalization: dict[str, float],
+    n_paths: int,
+    n_steps: int,
+    num_actions: int,
+    initial_v: float,
+    initial_s: float = 100.0,
+    initial_r_prev: float = 0.0,
+    actions: np.ndarray | None = None,
+    transition_matrix: np.ndarray | None = None,
+    initial_regime: int = 0,
+    action_seed: int | None = None,
+    noise_seed: int | None = None,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+    constant_action: bool = False,
+    cfg_w: float = 0.0,
+) -> RolloutResult:
+    """Roll out paths from an action-aware joint transition sampler.
+
+    The sampler must emit ``[log_v_next_norm, r_next_norm]`` from condition
+    ``[log_v_t_norm, r_t_norm, action_onehot]``.
+    """
+
+    if n_paths <= 0 or n_steps <= 0:
+        raise ValueError("n_paths and n_steps must be positive")
+    if num_actions <= 0:
+        raise ValueError("num_actions must be positive")
+    if joint_sampler.state_dim != 2:
+        raise ValueError("joint sampler must have state_dim=2")
+    expected_cond = 2 + num_actions
+    if joint_sampler.condition_dim != expected_cond:
+        raise ValueError(
+            f"joint sampler condition_dim {joint_sampler.condition_dim} != "
+            f"2 + num_actions = {expected_cond}"
+        )
+    if initial_v <= 0:
+        raise ValueError("initial_v must be positive")
+    if cfg_w < 0.0:
+        raise ValueError("cfg_w must be non-negative")
+
+    if actions is None:
+        actions = sample_action_schedule(
+            n_paths=n_paths, n_steps=n_steps, num_actions=num_actions,
+            transition_matrix=transition_matrix, initial_regime=initial_regime,
+            seed=action_seed, constant=constant_action,
+        )
+    actions = np.asarray(actions, dtype=np.int8)
+    if actions.shape != (n_paths, n_steps):
+        raise ValueError(f"actions shape must be ({n_paths}, {n_steps}), got {actions.shape}")
+    if actions.min() < 0 or actions.max() >= num_actions:
+        raise ValueError(f"action indices must be in [0, {num_actions})")
+
+    device = torch.device(device) if isinstance(device, str) else device
+
+    log_v_mean = float(normalization["log_v_mean"])
+    log_v_std = float(normalization["log_v_std"])
+    return_mean = float(normalization["return_mean"])
+    return_std = float(normalization["return_std"])
+
+    log_v_paths_norm = np.empty((n_paths, n_steps + 1), dtype=np.float32)
+    r_paths_norm = np.empty((n_paths, n_steps), dtype=np.float32)
+    log_v_t_norm = (np.log(initial_v) - log_v_mean) / log_v_std
+    log_v_paths_norm[:, 0] = log_v_t_norm
+    r_prev_norm = (initial_r_prev - return_mean) / return_std
+
+    log_v_t = torch.full((n_paths, 1), log_v_t_norm, device=device, dtype=dtype)
+    r_prev_t = torch.full((n_paths, 1), r_prev_norm, device=device, dtype=dtype)
+    actions_t = torch.from_numpy(actions).to(device=device)
+
+    rng = torch.Generator(device="cpu")
+    if noise_seed is not None:
+        rng.manual_seed(noise_seed)
+
+    for step in range(n_steps):
+        a_step = actions_t[:, step]
+        a_onehot = _onehot(a_step, num_actions).to(dtype=dtype)
+
+        condition = torch.cat([log_v_t, r_prev_t, a_onehot], dim=-1)
+        z = torch.randn(n_paths, 2, generator=rng, dtype=dtype).to(device)
+        next_state = joint_sampler.sample(condition, noise=z, cfg_w=cfg_w)
+        log_v_next = next_state[:, 0:1]
+        r_next = next_state[:, 1:2]
+
+        log_v_paths_norm[:, step + 1] = log_v_next.detach().cpu().numpy().reshape(-1)
+        r_paths_norm[:, step] = r_next.detach().cpu().numpy().reshape(-1)
+
+        log_v_t = log_v_next
+        r_prev_t = r_next
+
+    log_v_paths = log_v_paths_norm * log_v_std + log_v_mean
+    v_paths = np.exp(log_v_paths)
+    r_paths = r_paths_norm * return_std + return_mean
+
+    log_s = np.log(initial_s) + np.cumsum(r_paths, axis=1)
+    s_paths = np.concatenate(
+        [np.full((n_paths, 1), initial_s, dtype=np.float64), np.exp(log_s)], axis=1,
+    )
+
+    return RolloutResult(
+        log_v_paths_norm=log_v_paths_norm,
+        r_paths_norm=r_paths_norm,
+        log_v_paths=log_v_paths.astype(np.float32),
+        v_paths=v_paths.astype(np.float32),
+        r_paths=r_paths.astype(np.float32),
+        s_paths=s_paths.astype(np.float32),
+        actions=actions,
+        initial_v=float(initial_v),
+        initial_s=float(initial_s),
+        num_actions=num_actions,
+    )

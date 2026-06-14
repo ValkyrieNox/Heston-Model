@@ -5,7 +5,11 @@ Two public entry families:
 1. Single-stage joint model (legacy, kept for back compat with V3 baseline):
    ``TransitionFMModelConfig`` / ``TransitionFMTrainConfig`` / ``train_transition_fm``.
 
-2. V3 two-stage models:
+2. Action-aware joint model:
+   ``train_joint_trans_fm`` learns
+   ``p(log_v_next, r_next | log_v_t, r_t, action)`` in one FM teacher.
+
+3. V3 two-stage models:
    - Stage 1a (variance kernel): ``train_vol_trans_fm``
    - Stage 1b (return kernel):   ``train_ret_trans_fm``
    Both share ``TwoStageFMModelConfig`` and ``TransitionFMTrainConfig`` and
@@ -30,6 +34,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from finflow.data import (
+    HestonJointTransitionDataset,
     HestonRetTransitionDataset,
     HestonTransitionDataset,
     HestonVolTransitionDataset,
@@ -91,6 +96,8 @@ class TransitionFMTrainConfig:
     save_every_epochs: int = 0  # >0: also dump checkpoints/epoch_XXX.pt every N epochs
     lr_schedule: Literal["constant", "cosine"] = "constant"
     lr_min: float = 0.0  # eta_min for cosine schedule
+    ema_decay: float = 0.0  # >0: maintain EMA weights and save ema_* checkpoints
+    target_loss_weights: tuple[float, ...] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +295,7 @@ def evaluate_model(
     loader: DataLoader | TensorBatchLoader,
     device: torch.device,
     time_eps: float,
+    target_loss_weights: torch.Tensor | None = None,
     max_batches: int | None = None,
     desc: str = "val",
     disable_progress: bool = False,
@@ -308,6 +316,7 @@ def evaluate_model(
             target = batch["target"].to(device)
             loss = conditional_flow_matching_loss(
                 model, condition=condition, target=target, time_eps=time_eps,
+                target_weights=target_loss_weights,
             )
             batch_size = condition.shape[0]
             total_loss += float(loss.item()) * batch_size
@@ -330,6 +339,8 @@ def train_one_epoch(
     disable_progress: bool = False,
     progress_min_interval: float = 0.2,
     condition_transform: Callable[[dict[str, torch.Tensor], torch.Tensor], torch.Tensor] | None = None,
+    post_step_callback: Callable[[], None] | None = None,
+    target_loss_weights: torch.Tensor | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -348,11 +359,14 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         loss = conditional_flow_matching_loss(
             model, condition=condition, target=target, time_eps=time_eps,
+            target_weights=target_loss_weights,
         )
         loss.backward()
         if grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
+        if post_step_callback is not None:
+            post_step_callback()
         batch_size = condition.shape[0]
         total_loss += float(loss.item()) * batch_size
         total_items += batch_size
@@ -375,9 +389,18 @@ def save_checkpoint(
     stage: str = "joint",
     num_actions: int = 1,
     extra: dict[str, Any] | None = None,
+    model_state: dict[str, torch.Tensor] | None = None,
 ) -> None:
+    if model_state is None:
+        saved_model_state = {
+            name: tensor.detach().cpu() for name, tensor in model.state_dict().items()
+        }
+    else:
+        saved_model_state = {
+            name: tensor.detach().cpu() for name, tensor in model_state.items()
+        }
     checkpoint = {
-        "model_state": {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()},
+        "model_state": saved_model_state,
         "optimizer_state": optimizer.state_dict(),
         "epoch": epoch,
         "global_step": global_step,
@@ -392,6 +415,50 @@ def save_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, path)
+
+
+def _validate_ema_decay(decay: float) -> float:
+    decay = float(decay)
+    if decay < 0.0 or decay >= 1.0:
+        raise ValueError("ema_decay must be in [0, 1)")
+    return decay
+
+
+def _init_ema_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().clone()
+        for name, tensor in model.state_dict().items()
+    }
+
+
+@torch.no_grad()
+def _update_ema_state(
+    ema_state: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    decay: float,
+) -> None:
+    for name, tensor in model.state_dict().items():
+        current = tensor.detach()
+        ema = ema_state[name]
+        if torch.is_floating_point(ema):
+            ema.mul_(decay).add_(current, alpha=1.0 - decay)
+        else:
+            ema.copy_(current)
+
+
+def _target_loss_weights_tensor(
+    weights: tuple[float, ...] | None,
+    state_dim: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if weights is None:
+        return None
+    if len(weights) != state_dim:
+        raise ValueError(f"target_loss_weights must have length {state_dim}")
+    tensor = torch.as_tensor(weights, device=device, dtype=torch.float32)
+    if torch.any(tensor <= 0):
+        raise ValueError("target_loss_weights must be positive")
+    return tensor
 
 
 def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
@@ -431,6 +498,13 @@ def _run_fm_training(
 ) -> dict[str, Any]:
     device = resolve_device(train_config.device)
     model = model.to(device)
+    target_loss_weights = _target_loss_weights_tensor(
+        train_config.target_loss_weights, model.state_dim, device,
+    )
+    ema_decay = _validate_ema_decay(train_config.ema_decay)
+    ema_enabled = ema_decay > 0.0
+    ema_state = _init_ema_state(model) if ema_enabled else None
+    ema_model = TransitionFM(**model_config_dict).to(device) if ema_enabled else None
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=train_config.lr,
@@ -468,9 +542,11 @@ def _run_fm_training(
     ckpt_dir = run_dir / "checkpoints"
     metrics_path = run_dir / "metrics.jsonl"
     best_val_loss = float("inf")
+    best_ema_val_loss = float("inf")
     global_step = 0
     history: list[dict[str, Any]] = []
     epoch_ckpts: list[str] = []
+    ema_epoch_ckpts: list[str] = []
     extra_base = dict(checkpoint_extra or {})
 
     disable_progress = not train_config.progress
@@ -482,6 +558,8 @@ def _run_fm_training(
         header = (
             f"[finflow] stage={stage} | run={run_dir.name} | device={device} | "
             f"cache_data_device={int(train_config.cache_data_device)} | "
+            f"ema_decay={ema_decay:g} | "
+            f"target_loss_weights={train_config.target_loss_weights} | "
             f"params={n_params/1e3:.1f}k | train={len(datasets['train'])} samples "
             f"({train_batches} batch/epoch x {train_config.batch_size}) | "
             f"val={len(datasets['val'])} samples ({val_batches} batch) | epochs={train_config.epochs}"
@@ -498,6 +576,10 @@ def _run_fm_training(
         epoch_extra: dict[str, Any] = {}
         if train_condition_transform_factory is not None:
             condition_transform, epoch_extra = train_condition_transform_factory(epoch)
+        post_step_callback = (
+            (lambda: _update_ema_state(ema_state, model, ema_decay))
+            if ema_enabled and ema_state is not None else None
+        )
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device=device,
             time_eps=train_config.time_eps, grad_clip_norm=train_config.grad_clip_norm,
@@ -505,13 +587,27 @@ def _run_fm_training(
             desc=desc_train, disable_progress=disable_progress,
             progress_min_interval=train_config.progress_min_interval,
             condition_transform=condition_transform,
+            post_step_callback=post_step_callback,
+            target_loss_weights=target_loss_weights,
         )
         val_loss = evaluate_model(
             model, val_loader, device=device, time_eps=train_config.time_eps,
+            target_loss_weights=target_loss_weights,
             max_batches=train_config.max_val_batches,
             desc=desc_val, disable_progress=disable_progress,
             progress_min_interval=train_config.progress_min_interval,
         )
+        ema_val_loss = None
+        if ema_enabled and ema_state is not None and ema_model is not None:
+            ema_model.load_state_dict(ema_state)
+            ema_val_loss = evaluate_model(
+                ema_model, val_loader, device=device, time_eps=train_config.time_eps,
+                target_loss_weights=target_loss_weights,
+                max_batches=train_config.max_val_batches,
+                desc=f"epoch {epoch:>3}/{train_config.epochs} ema  ",
+                disable_progress=disable_progress,
+                progress_min_interval=train_config.progress_min_interval,
+            )
         epoch_time = time.monotonic() - epoch_start
         global_step += train_batches
 
@@ -523,6 +619,8 @@ def _run_fm_training(
             "epoch_time_s": epoch_time,
             "lr": optimizer.param_groups[0]["lr"],
         }
+        if ema_val_loss is not None:
+            record["ema_val_loss"] = ema_val_loss
         record.update(epoch_extra)
         history.append(record)
         with metrics_path.open("a", encoding="utf-8") as f:
@@ -546,6 +644,35 @@ def _run_fm_training(
                 extra={"train_loss": train_loss, "val_loss": val_loss, **extra_base, **epoch_extra},
             )
 
+        if ema_enabled and ema_state is not None and ema_val_loss is not None:
+            is_ema_best = ema_val_loss < best_ema_val_loss
+            if is_ema_best:
+                best_ema_val_loss = ema_val_loss
+            ema_extra = {
+                "train_loss": train_loss,
+                "val_loss": ema_val_loss,
+                "base_val_loss": val_loss,
+                "ema": True,
+                "ema_decay": ema_decay,
+                **extra_base,
+                **epoch_extra,
+            }
+            save_checkpoint(
+                ckpt_dir / "ema_last.pt", model, optimizer,
+                epoch=epoch, global_step=global_step, best_val_loss=best_ema_val_loss,
+                model_config=model_config_dict, train_config=asdict(train_config),
+                normalization=normalization, stage=stage, num_actions=num_actions,
+                extra=ema_extra, model_state=ema_state,
+            )
+            if is_ema_best:
+                save_checkpoint(
+                    ckpt_dir / "ema_best.pt", model, optimizer,
+                    epoch=epoch, global_step=global_step, best_val_loss=best_ema_val_loss,
+                    model_config=model_config_dict, train_config=asdict(train_config),
+                    normalization=normalization, stage=stage, num_actions=num_actions,
+                    extra=ema_extra, model_state=ema_state,
+                )
+
         # Periodic snapshots enable pricing-aware checkpoint selection downstream
         # (val_loss is known to be a poor proxy for path/pricing quality here).
         if train_config.save_every_epochs and (epoch % train_config.save_every_epochs == 0):
@@ -558,6 +685,25 @@ def _run_fm_training(
                 extra={"train_loss": train_loss, "val_loss": val_loss, **extra_base, **epoch_extra},
             )
             epoch_ckpts.append(str(epoch_path))
+            if ema_enabled and ema_state is not None and ema_val_loss is not None:
+                ema_epoch_path = ckpt_dir / f"ema_epoch_{epoch:03d}.pt"
+                save_checkpoint(
+                    ema_epoch_path, model, optimizer,
+                    epoch=epoch, global_step=global_step, best_val_loss=best_ema_val_loss,
+                    model_config=model_config_dict, train_config=asdict(train_config),
+                    normalization=normalization, stage=stage, num_actions=num_actions,
+                    extra={
+                        "train_loss": train_loss,
+                        "val_loss": ema_val_loss,
+                        "base_val_loss": val_loss,
+                        "ema": True,
+                        "ema_decay": ema_decay,
+                        **extra_base,
+                        **epoch_extra,
+                    },
+                    model_state=ema_state,
+                )
+                ema_epoch_ckpts.append(str(ema_epoch_path))
 
         if scheduler is not None:
             scheduler.step()
@@ -565,10 +711,14 @@ def _run_fm_training(
         if train_config.progress:
             elapsed = time.monotonic() - run_start
             eta_s = (elapsed / epoch) * (train_config.epochs - epoch)
+            ema_text = ""
+            if ema_val_loss is not None:
+                ema_text = f"ema_val={ema_val_loss:.4f} | ema_best={best_ema_val_loss:.4f} | "
             line = (
                 f"  epoch {epoch:>3}/{train_config.epochs} | "
                 f"train={train_loss:.4f} | val={val_loss:.4f} | "
                 f"{_format_epoch_extra(epoch_extra)}"
+                f"{ema_text}"
                 f"best={best_val_loss:.4f}{' *' if is_best else '  '} | "
                 f"epoch={_fmt_time(epoch_time)} | elapsed={_fmt_time(elapsed)} | "
                 f"eta={_fmt_time(eta_s)}"
@@ -589,6 +739,13 @@ def _run_fm_training(
         "device": str(device),
         "total_time_s": time.monotonic() - run_start,
     }
+    if ema_enabled:
+        summary["checkpoints"].update({
+            "ema_best": str(ckpt_dir / "ema_best.pt"),
+            "ema_last": str(ckpt_dir / "ema_last.pt"),
+            "ema_epochs": ema_epoch_ckpts,
+        })
+        summary["best_ema_val_loss"] = best_ema_val_loss
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
@@ -664,6 +821,99 @@ def train_transition_fm(
         stage="joint",
         num_actions=load_num_actions(data_dir),
         config_blob_extra={"data_dir": str(Path(data_dir).resolve())},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage: action-aware joint transition kernel
+# ---------------------------------------------------------------------------
+
+
+def build_joint_datasets(
+    data_dir: str | Path,
+    normalization: dict[str, float],
+    num_actions: int,
+    train_action_dropout_prob: float = 0.0,
+) -> dict[str, HestonJointTransitionDataset]:
+    data_dir = Path(data_dir)
+    return {
+        split: HestonJointTransitionDataset(
+            data_dir / f"{split}_transitions.npz",
+            normalize=True,
+            log_v_mean=normalization["log_v_mean"],
+            log_v_std=normalization["log_v_std"],
+            return_mean=normalization["return_mean"],
+            return_std=normalization["return_std"],
+            num_actions=num_actions,
+            action_dropout_prob=train_action_dropout_prob if split == "train" else 0.0,
+        )
+        for split in ("train", "val", "test")
+    }
+
+
+def train_joint_trans_fm(
+    data_dir: str | Path,
+    output_dir: str | Path,
+    run_name: str | None = None,
+    num_actions: int | None = None,
+    model_config: TwoStageFMModelConfig | None = None,
+    train_config: TransitionFMTrainConfig | None = None,
+) -> dict[str, Any]:
+    """Train an action-aware joint FM.
+
+    The model samples ``[log_v_next_norm, r_next_norm]`` jointly from
+    ``[log_v_t_norm, r_t_norm, action_onehot]``. This keeps the immediate
+    return/volatility dependence inside one teacher instead of splitting it
+    across Stage 1a/1b.
+    """
+
+    train_config = train_config or TransitionFMTrainConfig()
+    set_seed(train_config.seed)
+
+    if num_actions is None:
+        num_actions = load_num_actions(data_dir)
+    normalization = load_normalization(data_dir)
+    datasets = build_joint_datasets(
+        data_dir, normalization, num_actions,
+        train_action_dropout_prob=train_config.action_dropout_prob,
+    )
+
+    if model_config is None:
+        model_config = TwoStageFMModelConfig(
+            state_dim=2, condition_dim=2 + num_actions,
+        )
+    else:
+        expected = 2 + num_actions
+        if model_config.state_dim != 2:
+            raise ValueError("joint-stage model_config.state_dim must be 2")
+        if model_config.condition_dim != expected:
+            raise ValueError(
+                f"joint-stage condition_dim must be 2 + num_actions = {expected},"
+                f" got {model_config.condition_dim}"
+            )
+
+    transition_extra = {
+        "kind": "fm",
+        "transition_type": "joint_vr",
+        "condition": ["log_v_t", "r_t", "action"],
+        "target": ["log_v_next", "r_next"],
+    }
+    run_dir = build_run_dir(output_dir, run_name=run_name, prefix="joint_trans_fm")
+    model = TransitionFM(**asdict(model_config))
+    return _run_fm_training(
+        model=model,
+        datasets=datasets,
+        train_config=train_config,
+        run_dir=run_dir,
+        normalization=normalization,
+        model_config_dict=asdict(model_config),
+        stage="joint",
+        num_actions=num_actions,
+        config_blob_extra={
+            "data_dir": str(Path(data_dir).resolve()),
+            **transition_extra,
+        },
+        checkpoint_extra=transition_extra,
     )
 
 

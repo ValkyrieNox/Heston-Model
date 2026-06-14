@@ -21,6 +21,15 @@ def test_fm_teacher_sampler_shape():
     assert torch.isfinite(out).all()
 
 
+def test_fm_teacher_sampler_heun_shape():
+    torch.manual_seed(0)
+    model = TransitionFM(state_dim=1, condition_dim=3, hidden_dim=16, time_embedding_dim=8, num_blocks=2)
+    sampler = FMTeacherSampler(model, n_steps=4, solver="heun")
+    out = sampler.sample(_cond(6, 3))
+    assert out.shape == (6, 1)
+    assert torch.isfinite(out).all()
+
+
 def test_mean_flow_sampler_shape():
     torch.manual_seed(0)
     model = MeanFlowStudent(state_dim=1, condition_dim=3, hidden_dim=16, time_embedding_dim=8, num_blocks=2)

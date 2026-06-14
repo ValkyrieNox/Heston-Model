@@ -11,6 +11,7 @@ from finflow.data.heston import (
     simulate_regime_switching_heston,
 )
 from finflow.data.dataset import (
+    HestonJointTransitionDataset,
     HestonRetTransitionDataset,
     HestonTransitionDataset,
     HestonVolTransitionDataset,
@@ -28,6 +29,7 @@ __all__ = [
     "DEFAULT_TRANSITION_MATRIX",
     "HestonOptionGrid",
     "HestonParams",
+    "HestonJointTransitionDataset",
     "HestonRetTransitionDataset",
     "HestonTransitionDataset",
     "HestonVolTransitionDataset",
